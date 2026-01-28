@@ -11,6 +11,8 @@ GRAY='\033[0;90m'
 RESET='\033[0m'
 
 # ================== 常量定义 ==================
+# 请确保这个地址是你最新的脚本地址
+SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
 SHOES_BIN="/usr/local/bin/shoes"
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
@@ -42,21 +44,34 @@ get_public_ip() {
     curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}'
 }
 
-# ================== 快捷指令 (本地复制版) ==================
+# ================== 快捷指令 (智能修复版) ==================
 create_shortcut() {
-    # 获取当前脚本的绝对路径
-    CURRENT_FILE=$(readlink -f "$0")
+    # 尝试获取当前脚本的绝对路径
+    local current_file=$(readlink -f "$0")
+    local install_path="/usr/local/bin/shoes-menu"
+    local bin_link="/usr/bin/shoes"
+
+    # 方案 A: 如果当前脚本是本地文件，直接复制
+    if [[ -f "$current_file" && ! -L "$current_file" ]]; then
+        cp -f "$current_file" "$install_path"
+        echo -e "${GREEN}>>> 已从本地文件安装快捷指令。${RESET}"
     
-    # 只有当脚本是作为一个文件存在时，才创建快捷方式
-    if [[ -f "$CURRENT_FILE" ]]; then
-        cp -f "$CURRENT_FILE" /usr/local/bin/shoes-menu
-        chmod +x /usr/local/bin/shoes-menu
-        ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes
-        echo -e "${GREEN}>>> 快捷指令 'shoes' 已修复！${RESET}"
+    # 方案 B: 如果是管道/粘贴运行，尝试从 GitHub 下载
     else
-        echo -e "${RED}>>> 警告：未检测到脚本文件实体，跳过快捷指令创建。${RESET}"
-        echo -e "${YELLOW}>>> 请将代码保存为文件 (例如 shoes.sh) 并运行 bash shoes.sh 才能启用快捷键。${RESET}"
+        echo -e "${YELLOW}>>> 检测到在线运行/粘贴运行，正在尝试从 GitHub 拉取脚本以修复快捷键...${RESET}"
+        # 检测网络
+        if curl -s --head --request GET "$SCRIPT_URL" | grep "200 OK" > /dev/null; then
+            curl -sL "$SCRIPT_URL" -o "$install_path"
+            echo -e "${GREEN}>>> 已从 GitHub 下载并修复快捷指令。${RESET}"
+        else
+            echo -e "${RED}>>> 错误：无法连接 GitHub 仓库，且未找到本地脚本文件。${RESET}"
+            echo -e "${RED}>>> 快捷键 'shoes' 可能无法使用。请将脚本保存为 shoes.sh 后再运行一次。${RESET}"
+            return
+        fi
     fi
+    
+    chmod +x "$install_path"
+    ln -sf "$install_path" "$bin_link"
 }
 
 # ================== 核心功能: 下载二进制 ==================
@@ -102,7 +117,7 @@ install_shoes() {
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
 
-    # 2. AnyTLS (使用 UUID)
+    # 2. AnyTLS (UUID)
     ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
     ANYTLS_USER="anytls"
     ANYTLS_PASS=$(cat /proc/sys/kernel/random/uuid) 
@@ -206,7 +221,6 @@ generate_links_content() {
     local ss22_port=${15}; local ss22_pass=${16}; local ss22_cipher=${17}
     HOST_IP=$(get_public_ip)
     
-    # Links
     VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_${sni}"
     SS_BASE=$(echo -n "${ss_cipher}:${ss_pass}" | base64 -w 0)
     SS_LINK="ss://${SS_BASE}@${HOST_IP}:${ss_port}#Shoes_Legacy"
@@ -275,7 +289,7 @@ view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoe
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V19.0 快捷键修复版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V20.0 智能修复版) ===${RESET}"
     echo -e "${GRAY}输入 'shoes' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
@@ -293,7 +307,7 @@ show_menu() {
     read -p "选项: " choice
 }
 
-# 自动创建快捷方式并启动
+# 启动时尝试创建/修复快捷键
 create_shortcut
 check_arch
 
@@ -304,7 +318,7 @@ while true; do
         2) systemctl stop shoes; echo "停用";; 
         3) systemctl restart shoes; echo "重启";;
         4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
-        5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/bin/shoes"; systemctl daemon-reload; echo "卸载完毕";;
+        5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/shoes-menu"; systemctl daemon-reload; echo "卸载完毕";;
         6) switch_system_ipv6 ;;
         7) enable_bbr ;;       
         8) update_shoes_only ;; 
