@@ -11,12 +11,12 @@ GRAY='\033[0;90m'
 RESET='\033[0m'
 
 # ================== 常量定义 ==================
-# 你的 Github 脚本地址
 SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
 
-# 关键修改：内核改名为 shoes-core，避免和菜单命令冲突
-SHOES_BIN="/usr/local/bin/shoes-core"
-MENU_BIN="/usr/local/bin/shoes"
+# === 关键修改：菜单命令改为 sho ===
+SHOES_BIN="/usr/local/bin/shoes-core"  # 内核名字
+MENU_BIN="/usr/local/bin/sho"          # 菜单脚本名字 (实体)
+SHORTCUT_BIN="/usr/bin/sho"            # 系统快捷键 (软链接)
 
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
@@ -48,11 +48,11 @@ get_public_ip() {
     curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}'
 }
 
-# ================== 快捷指令 (智能修复版) ==================
+# ================== 快捷指令 (sho) ==================
 create_shortcut() {
     local current_file=$(readlink -f "$0")
     
-    # 强制覆盖 /usr/local/bin/shoes 为菜单脚本
+    # 强制覆盖菜单脚本
     if [[ -f "$current_file" && ! -L "$current_file" ]]; then
         cp -f "$current_file" "$MENU_BIN"
         echo -e "${GREEN}>>> 已安装菜单到: ${MENU_BIN}${RESET}"
@@ -68,8 +68,14 @@ create_shortcut() {
     fi
     
     chmod +x "$MENU_BIN"
-    # 同时建立 /usr/bin/shoes 链接，双重保险
-    ln -sf "$MENU_BIN" "/usr/bin/shoes"
+    # 创建 /usr/bin/sho 链接
+    ln -sf "$MENU_BIN" "$SHORTCUT_BIN"
+    
+    # === 顺手清理掉旧的 shoes 命令，防止冲突 ===
+    if [[ -L "/usr/bin/shoes" || -f "/usr/bin/shoes" ]]; then
+        rm -f "/usr/bin/shoes"
+        echo -e "${YELLOW}>>> 已清理旧的 'shoes' 命令，现在请使用 'sho'。${RESET}"
+    fi
 }
 
 # ================== 核心功能: 下载二进制 ==================
@@ -91,17 +97,7 @@ download_shoes_core() {
     
     systemctl stop shoes >/dev/null 2>&1
     
-    # 清理旧的冲突文件 (如果 /usr/local/bin/shoes 是二进制文件，删掉它)
-    if [[ -f "/usr/local/bin/shoes" ]]; then
-        # 简单判断：如果是二进制文件(很大)，删掉；如果是脚本(很小)，保留覆盖
-        FILE_SIZE=$(stat -c%s "/usr/local/bin/shoes")
-        if [[ $FILE_SIZE -gt 100000 ]]; then
-            echo -e "${YELLOW}>>> 发现旧版二进制文件占用了名字，正在清理...${RESET}"
-            rm -f "/usr/local/bin/shoes"
-        fi
-    fi
-
-    # 移动新内核到 core 路径
+    # 移动并重命名为 shoes-core
     cp "$FIND_SHOES" "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
     return 0
@@ -127,7 +123,7 @@ install_shoes() {
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
 
-    # 2. AnyTLS
+    # 2. AnyTLS (UUID)
     ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
     ANYTLS_USER="anytls"
     ANYTLS_PASS=$(cat /proc/sys/kernel/random/uuid) 
@@ -199,7 +195,7 @@ install_shoes() {
     udp_enabled: true
 EOF
 
-    # 注意：Systemd 里的 ExecStart 也指向了新的 shoes-core
+    # Systemd 指向 shoes-core
     cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -300,8 +296,8 @@ view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoe
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V21.0 冲突修复版) ===${RESET}"
-    echo -e "${GRAY}输入 'shoes' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V22.0 极简指令 sho 版) ===${RESET}"
+    echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
     echo "2. 停止服务"
@@ -318,7 +314,6 @@ show_menu() {
     read -p "选项: " choice
 }
 
-# 启动时创建/修复快捷键
 create_shortcut
 check_arch
 
@@ -329,7 +324,7 @@ while true; do
         2) systemctl stop shoes; echo "停用";; 
         3) systemctl restart shoes; echo "重启";;
         4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
-        5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/shoes-menu"; systemctl daemon-reload; echo "卸载完毕";;
+        5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/sho" "/usr/bin/sho"; systemctl daemon-reload; echo "卸载完毕";;
         6) switch_system_ipv6 ;;
         7) enable_bbr ;;       
         8) update_shoes_only ;; 
