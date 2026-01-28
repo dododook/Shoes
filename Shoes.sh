@@ -13,10 +13,10 @@ RESET='\033[0m'
 # ================== 常量定义 ==================
 SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
 
-# === 关键修改：菜单命令改为 sho ===
-SHOES_BIN="/usr/local/bin/shoes-core"  # 内核名字
-MENU_BIN="/usr/local/bin/sho"          # 菜单脚本名字 (实体)
-SHORTCUT_BIN="/usr/bin/sho"            # 系统快捷键 (软链接)
+# === 关键：文件路径定义 ===
+SHOES_BIN="/usr/local/bin/shoes-core"  # 核心程序改名，避开冲突
+MENU_BIN="/usr/local/bin/sho"          # 菜单脚本
+SHORTCUT_BIN="/usr/bin/sho"            # 快捷方式
 
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
@@ -55,26 +55,21 @@ create_shortcut() {
     # 强制覆盖菜单脚本
     if [[ -f "$current_file" && ! -L "$current_file" ]]; then
         cp -f "$current_file" "$MENU_BIN"
-        echo -e "${GREEN}>>> 已安装菜单到: ${MENU_BIN}${RESET}"
+        echo -e "${GREEN}>>> 已更新菜单脚本: ${MENU_BIN}${RESET}"
     else
-        echo -e "${YELLOW}>>> 在线模式，正在下载脚本...${RESET}"
+        # 在线模式
         if curl -s --head --request GET "$SCRIPT_URL" | grep "200 OK" > /dev/null; then
             curl -sL "$SCRIPT_URL" -o "$MENU_BIN"
-            echo -e "${GREEN}>>> 菜单已修复。${RESET}"
-        else
-            echo -e "${RED}>>> 无法下载脚本，快捷键可能失效。${RESET}"
-            return
         fi
     fi
     
     chmod +x "$MENU_BIN"
-    # 创建 /usr/bin/sho 链接
     ln -sf "$MENU_BIN" "$SHORTCUT_BIN"
     
-    # === 顺手清理掉旧的 shoes 命令，防止冲突 ===
-    if [[ -L "/usr/bin/shoes" || -f "/usr/bin/shoes" ]]; then
+    # 清理旧的冲突文件
+    if [[ -f "/usr/bin/shoes" || -L "/usr/bin/shoes" ]]; then
         rm -f "/usr/bin/shoes"
-        echo -e "${YELLOW}>>> 已清理旧的 'shoes' 命令，现在请使用 'sho'。${RESET}"
+        echo -e "${YELLOW}>>> 已清理冲突命令 'shoes'，请使用 'sho'。${RESET}"
     fi
 }
 
@@ -111,6 +106,8 @@ install_shoes() {
 
     mkdir -p "${SHOES_CONF_DIR}"
     
+    # === 参数生成 ===
+    
     # 1. Reality
     SNI_LIST=("www.microsoft.com" "itunes.apple.com" "gateway.icloud.com" "www.amazon.com" "www.tesla.com" "dl.google.com" "www.yahoo.com")
     SNI=${SNI_LIST[$RANDOM % ${#SNI_LIST[@]}]}
@@ -138,15 +135,17 @@ install_shoes() {
     SOCKS_USER="socks"
     SOCKS_PASS=$(openssl rand -base64 8)
 
-    # 5. SS-2022
+    # 5. SS-2022 (核心修复：直接用 openssl 生成纯净密钥)
     SS22_PORT=$(shuf -i 45001-55000 -n 1)
     SS22_CIPHER="2022-blake3-aes-256-gcm"
-    SS22_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password "${SS22_CIPHER}" | grep -v "\-\-\-" | grep -v "${SS22_CIPHER}" | awk '{$1=$1;print}' | head -n 1)
+    # 生成 32 字节的 Base64 密钥，完全符合标准且无杂质
+    SS22_PASSWORD=$(openssl rand -base64 32)
 
+    # 自签名证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
 
-    # 写入配置
+    # === 写入配置 ===
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -195,7 +194,7 @@ install_shoes() {
     udp_enabled: true
 EOF
 
-    # Systemd 指向 shoes-core
+    # === Systemd (指向 shoes-core) ===
     cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -215,7 +214,7 @@ EOF
     systemctl daemon-reload
     systemctl enable --now shoes
     create_shortcut
-    echo -e "${GREEN}Shoes (5协议) 安装完成！${RESET}"
+    echo -e "${GREEN}Shoes (5协议) 安装完成！配置已修复。${RESET}"
     generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
 }
 
@@ -296,7 +295,7 @@ view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoe
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V22.0 极简指令 sho 版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V23.0 稳定修复版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
