@@ -1,10 +1,11 @@
 #!/bin/bash
 
-# ================== 颜色代码 ==================
+# ================== 颜色代码 (完美复刻版) ==================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'  # 截图里的粉紫色 IP
 CYAN='\033[0;36m'
 GRAY='\033[0;90m'
 RESET='\033[0m'
@@ -97,7 +98,7 @@ install_shoes() {
     ANYTLS_USER="any"
     ANYTLS_PASS=$(openssl rand -base64 8) 
 
-    # 3. Shadowsocks (传统 AEAD)
+    # 3. Shadowsocks (Legacy)
     SS_PORT=$(shuf -i 35001-40000 -n 1)
     SS_CIPHER="aes-256-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
@@ -107,17 +108,15 @@ install_shoes() {
     SOCKS_USER="socks"
     SOCKS_PASS=$(openssl rand -base64 8)
 
-    # 5. Shadowsocks-2022 (新增!)
+    # 5. SS-2022
     SS22_PORT=$(shuf -i 45001-55000 -n 1)
     SS22_CIPHER="2022-blake3-aes-256-gcm"
-    # 调用 shoes 内核生成专用密钥 (awk取最后一段以防有前缀)
     SS22_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password "${SS22_CIPHER}" | awk '{print $NF}')
 
-    # 生成自签名证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
 
-    # === 写入配置 (5个入站) ===
+    # 写入配置
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -166,7 +165,6 @@ install_shoes() {
     udp_enabled: true
 EOF
 
-    # Systemd
     cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -211,25 +209,121 @@ generate_links_content() {
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
     echo -e "\n--- [1] VLESS Reality (SNI: ${sni}) ---" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${VLESS_LINK}${RESET}" | tee -a "${LINK_FILE}"
-    
-    echo -e "\n--- [2] SS-2022 (抗重放/高性能/推荐) ---" | tee -a "${LINK_FILE}"
-    echo -e "加密: ${ss22_cipher}" | tee -a "${LINK_FILE}"
+    echo -e "\n--- [2] SS-2022 (抗重放/推荐) ---" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SS22_LINK}${RESET}" | tee -a "${LINK_FILE}"
-
     echo -e "\n--- [3] SS-Legacy (传统/游戏) ---" | tee -a "${LINK_FILE}"
-    echo -e "加密: ${ss_cipher}" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
-    
-    echo -e "\n--- [4] SOCKS5 (账号: ${socks_user}) ---" | tee -a "${LINK_FILE}"
-    echo -e "地址: ${HOST_IP}:${socks_port}" | tee -a "${LINK_FILE}"
+    echo -e "\n--- [4] SOCKS5 (TG专用) ---" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SOCKS_LINK}${RESET}" | tee -a "${LINK_FILE}"
-    
     echo -e "\n--- [5] AnyTLS (HTTPS Proxy) ---" | tee -a "${LINK_FILE}"
     echo -e "地址: ${HOST_IP}:${any_port}" | tee -a "${LINK_FILE}"
     echo -e "用户: ${any_user} | 密码: ${any_pass}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 辅助功能 (省略重复代码) ==================
+# ================== 高级 IPv6 切换 (1:1 UI复刻版) ==================
+switch_system_ipv6() {
+    clear
+    # 完美复刻截图头部
+    echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
+    echo -e "${GREEN}➜ ${RESET}正在扫描网卡上的公网 IPv6 地址..."
+    echo -e "${GREEN}➜ ${RESET}正在进行 地区解析 与 延迟测试 (Cloudflare)..."
+    echo -e "${GRAY}(如果 IP 较多，测试可能需要几秒钟，请耐心等待)${RESET}"
+    echo ""
+    
+    # 1. 提取 IP
+    local ip_with_prefix=()
+    mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
+
+    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then
+        echo -e "${RED}未检测到可用的公网 IPv6 地址。${RESET}"
+        read -rp "按回车返回..." _
+        return
+    fi
+    
+    echo -e "${GREEN}请选择要设为默认出口的 IP:${RESET}\n"
+
+    local i=1
+    local ping_cmd="ping -6"
+    if ! command -v ping >/dev/null 2>&1; then ping_cmd="ping6"; fi
+
+    for item in "${ip_with_prefix[@]}"; do
+        local addr=${item%/*}
+        
+        # 状态标记 (复刻截图逻辑：deprecated=备用, else=当前活跃)
+        local status_mark=""
+        if ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then
+            status_mark="${GRAY}(备用)${RESET}"
+        else
+            status_mark="${GREEN}✔${RESET} ${YELLOW}(当前活跃)${RESET}"
+        fi
+        
+        # 地区检测
+        local loc_str=""
+        if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+            local api_res
+            api_res=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city" 2>/dev/null)
+            if [[ -n "$api_res" ]]; then
+                local country=$(echo "$api_res" | jq -r '.country // empty')
+                local city=$(echo "$api_res" | jq -r '.city // empty')
+                [[ -n "$country" ]] && loc_str="${BLUE}[${country} ${city}]${RESET}" || loc_str="${GRAY}[未知]${RESET}"
+            else
+                loc_str="${GRAY}[超时]${RESET}"
+            fi
+        fi
+        
+        # 延迟检测
+        local lat_val
+        lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
+        local lat_str=""
+        if [[ -n "$lat_val" ]]; then
+            local lat_num=${lat_val%.*}
+            if [[ "$lat_num" -lt 100 ]]; then
+                lat_str="${GREEN}[${lat_val}ms]${RESET}"
+            elif [[ "$lat_num" -lt 200 ]]; then
+                lat_str="${YELLOW}[${lat_val}ms]${RESET}"
+            else
+                lat_str="${RED}[${lat_val}ms]${RESET}"
+            fi
+        else
+            lat_str="${RED}[超时]${RESET}"
+        fi
+
+        # 核心复刻：IP用紫色(PURPLE)，格式完全对其
+        echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"
+        ((i++))
+    done
+    echo -e " ${GREEN}[0]${RESET} 取消返回"
+    echo ""
+
+    read -rp "请输入序号 [0-$((i-1))]: " choice
+    [[ "$choice" == "0" || -z "$choice" ]] && return
+
+    local target_item="${ip_with_prefix[$((choice-1))]}"
+    local target_ip="${target_item%/*}"
+    [[ -z "$target_ip" ]] && return
+
+    echo -e "\n正在切换出口 IP 至: $target_ip ..."
+    
+    local gateway=$(ip -6 route show default | awk '/via/ {print $3}' | head -n1)
+    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1)
+    [[ -z "$dev_name" ]] && dev_name="eth0"
+
+    for item in "${ip_with_prefix[@]}"; do
+        ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1
+    done
+    ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
+
+    if [[ -n "$gateway" ]]; then
+        ip -6 route replace default via "$gateway" dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1
+    else
+        ip -6 route replace default dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1
+    fi
+    
+    echo -e "${GREEN}切换成功！${RESET}"
+    read -rp "按回车继续..." _
+}
+
+# ================== 辅助功能 ==================
 update_shoes_only() {
     echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core
     if [[ $? -eq 0 ]]; then systemctl restart shoes; echo -e "${GREEN}更新成功${RESET}"; fi
@@ -240,36 +334,11 @@ enable_bbr() {
     sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _
 }
 view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoes -f; }
-switch_system_ipv6() {
-    clear; echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
-    echo -e "正在扫描网卡上的公网 IPv6 地址..."
-    local ip_with_prefix=(); mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
-    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}无 IPv6${RESET}"; read -p "..." _; return; fi
-    echo -e "正在测试地区与延迟..."
-    local i=1; local ping_cmd="ping -6"; command -v ping >/dev/null 2>&1 || ping_cmd="ping6"
-    for item in "${ip_with_prefix[@]}"; do
-        local addr=${item%/*}; local status_mark=""; local loc_str=""; local lat_str=""
-        if ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then status_mark="${GRAY}(备用)${RESET}"; else status_mark="${GREEN}✔${RESET}"; fi
-        local api_res=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city" 2>/dev/null)
-        if [[ -n "$api_res" ]]; then loc_str="${BLUE}[$(echo "$api_res"|jq -r '.country') $(echo "$api_res"|jq -r '.city')]${RESET}"; else loc_str="${GRAY}[未知]${RESET}"; fi
-        local lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
-        if [[ -n "$lat_val" ]]; then lat_str="${GREEN}[${lat_val}ms]${RESET}"; else lat_str="${RED}[超时]${RESET}"; fi
-        echo -e " ${GREEN}[$i]${RESET} ${YELLOW}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"; ((i++))
-    done
-    echo -e " ${GREEN}[0]${RESET} 取消"; read -rp "选择: " choice
-    [[ "$choice" == "0" || -z "$choice" ]] && return
-    local target_item="${ip_with_prefix[$((choice-1))]}"
-    [[ -z "$target_item" ]] && return
-    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1); [[ -z "$dev_name" ]] && dev_name="eth0"
-    for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1; done
-    ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
-    echo -e "${GREEN}切换成功！${RESET}"; read -rp "..." _
-}
 
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V12.0 究极版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V14.0 UI复刻版) ===${RESET}"
     echo -e "${GRAY}输入 'shoes' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
