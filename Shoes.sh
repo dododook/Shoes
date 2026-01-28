@@ -2,7 +2,7 @@
 
 # ================== 颜色代码 ==================
 RED='\033[0;31m'
-GREEN='\033[1;32m' # 亮绿色
+GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
@@ -106,35 +106,57 @@ ask_port() {
     local prompt=$1
     local default_port=$2
     local port_var=""
+    
     while true; do
         read -rp "$prompt [默认随机: $default_port]: " port_var
-        if [[ -z "$port_var" ]]; then echo "$default_port"; return; fi
-        if [[ "$port_var" =~ ^[0-9]+$ ]] && [ "$port_var" -ge 1 ] && [ "$port_var" -le 65535 ]; then echo "$port_var"; return; else echo -e "${RED}无效端口${RESET}" >&2; fi
+        if [[ -z "$port_var" ]]; then
+            echo "$default_port"
+            return
+        fi
+        
+        if [[ "$port_var" =~ ^[0-9]+$ ]] && [ "$port_var" -ge 1 ] && [ "$port_var" -le 65535 ]; then
+            echo "$port_var"
+            return
+        else
+            echo -e "${RED}无效端口，请输入 1-65535 之间的数字。${RESET}" >&2
+        fi
     done
 }
 
-# ================== 安装/重置 Shoes ==================
+# ================== 安装/重置 Shoes (核心逻辑) ==================
 install_shoes() {
+    # 参数 $1: 如果是 "custom"，则询问端口；否则全随机
     local mode=$1
+    
     install_dependencies
     download_shoes_core
     if [[ $? -ne 0 ]]; then return; fi
 
     mkdir -p "${SHOES_CONF_DIR}"
     
+    # 预生成随机端口
     local rnd_vless=$(shuf -i 20001-30000 -n 1)
     local rnd_any=$(shuf -i 30001-35000 -n 1)
     local rnd_ss=$(shuf -i 35001-40000 -n 1)
     local rnd_ss22=$(shuf -i 40001-50000 -n 1)
 
-    VLESS_PORT=$rnd_vless; ANYTLS_PORT=$rnd_any; SS_PORT=$rnd_ss; SS22_PORT=$rnd_ss22
+    # 变量初始化
+    VLESS_PORT=$rnd_vless
+    ANYTLS_PORT=$rnd_any
+    SS_PORT=$rnd_ss
+    SS22_PORT=$rnd_ss22
 
+    #如果是自定义模式，开始询问
     if [[ "$mode" == "custom" ]]; then
-        echo -e "\n${CYAN}=== NAT/自定义端口模式 ===${RESET}"
+        echo -e "\n${CYAN}=== 进入 NAT/自定义端口 模式 ===${RESET}"
+        echo -e "${GRAY}请输入您想使用的端口号，直接回车则使用随机端口。${RESET}"
+        
         VLESS_PORT=$(ask_port "请输入 VLESS Reality 端口" $rnd_vless)
         ANYTLS_PORT=$(ask_port "请输入 AnyTLS (HTTPS) 端口" $rnd_any)
         SS_PORT=$(ask_port "请输入 SS-Legacy 端口" $rnd_ss)
         SS22_PORT=$(ask_port "请输入 SS-2022 端口" $rnd_ss22)
+        
+        echo -e "${GREEN}端口已确认: VLESS=$VLESS_PORT, AnyTLS=$ANYTLS_PORT, SS=$SS_PORT, SS22=$SS22_PORT${RESET}\n"
     fi
 
     # === 1. Reality ===
@@ -145,50 +167,94 @@ install_shoes() {
     KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
-    open_port "$VLESS_PORT" "tcp"; open_port "$VLESS_PORT" "udp"
+    open_port "$VLESS_PORT" "tcp"
+    open_port "$VLESS_PORT" "udp"
 
     # === 2. AnyTLS ===
-    ANYTLS_USER="anytls"; ANYTLS_PASS=$(openssl rand -hex 8); ANYTLS_SNI="www.bing.com"
+    ANYTLS_USER="anytls"
+    ANYTLS_PASS=$(openssl rand -hex 8)
+    ANYTLS_SNI="www.bing.com"
     open_port "$ANYTLS_PORT" "tcp"
 
-    # === 3. Shadowsocks ===
-    SS_CIPHER="aes-256-gcm"; SS_PASSWORD=$(openssl rand -base64 16)
-    open_port "$SS_PORT" "tcp"; open_port "$SS_PORT" "udp"
+    # === 3. Shadowsocks (Legacy) ===
+    SS_CIPHER="aes-256-gcm"
+    SS_PASSWORD=$(openssl rand -base64 16)
+    open_port "$SS_PORT" "tcp"
+    open_port "$SS_PORT" "udp"
 
     # === 4. SS-2022 ===
-    SS22_CIPHER="2022-blake3-aes-256-gcm"; SS22_PASSWORD=$(openssl rand -base64 32)
-    open_port "$SS22_PORT" "tcp"; open_port "$SS22_PORT" "udp"
+    SS22_CIPHER="2022-blake3-aes-256-gcm"
+    SS22_PASSWORD=$(openssl rand -base64 32)
+    open_port "$SS22_PORT" "tcp"
+    open_port "$SS22_PORT" "udp"
 
+    # 证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}"
 
+    # 写入配置
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
-  protocol: { type: tls, reality_targets: { "${SNI}": { private_key: "${PRIVATE_KEY}", short_ids: ["${SHID}"], dest: "${SNI}:443", vision: true, protocol: { type: vless, user_id: "${UUID}", udp_enabled: true } } } }
+  protocol:
+    type: tls
+    reality_targets:
+      "${SNI}":
+        private_key: "${PRIVATE_KEY}"
+        short_ids: ["${SHID}"]
+        dest: "${SNI}:443"
+        vision: true
+        protocol:
+          type: vless
+          user_id: "${UUID}"
+          udp_enabled: true
 - address: "0.0.0.0:${ANYTLS_PORT}"
-  protocol: { type: tls, tls_targets: { "${ANYTLS_SNI}": { cert: "/etc/shoes/cert.pem", key: "/etc/shoes/key.pem", protocol: { type: anytls, users: [{ name: "${ANYTLS_USER}", password: "${ANYTLS_PASS}" }], udp_enabled: true } } } }
+  protocol:
+    type: tls
+    tls_targets:
+      "${ANYTLS_SNI}":
+        cert: "/etc/shoes/cert.pem"
+        key: "/etc/shoes/key.pem"
+        protocol:
+          type: anytls
+          users:
+            - name: "${ANYTLS_USER}"
+              password: "${ANYTLS_PASS}"
+          udp_enabled: true
 - address: "0.0.0.0:${SS_PORT}"
-  protocol: { type: shadowsocks, cipher: "${SS_CIPHER}", password: "${SS_PASSWORD}", udp_enabled: true }
+  protocol:
+    type: shadowsocks
+    cipher: "${SS_CIPHER}"
+    password: "${SS_PASSWORD}"
+    udp_enabled: true
 - address: "0.0.0.0:${SS22_PORT}"
-  protocol: { type: shadowsocks, cipher: "${SS22_CIPHER}", password: "${SS22_PASSWORD}", udp_enabled: true }
+  protocol:
+    type: shadowsocks
+    cipher: "${SS22_CIPHER}"
+    password: "${SS22_PASSWORD}"
+    udp_enabled: true
 EOF
 
     cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
 After=network.target
+
 [Service]
 Type=simple
 User=root
 ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
 Restart=on-failure
 LimitNOFILE=65535
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload; systemctl enable --now shoes; create_shortcut
-    echo -e "${GREEN}Shoes 安装完成！${RESET}"
+    systemctl daemon-reload
+    systemctl enable --now shoes
+    create_shortcut
+    echo -e "${GREEN}Shoes (4协议安全版) 安装完成！${RESET}"
+    
     generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$ANYTLS_SNI" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
 }
 
@@ -219,7 +285,7 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 网络设置子菜单 ==================
+# ================== Menu 6: 网络工具箱 ==================
 sub_switch_ipv6_exit() {
     clear; echo -e "${CYAN}=== IPv6 出口切换 ===${RESET}"; echo -e "${GREEN}➜ ${RESET}扫描中..."
     local ip_with_prefix=(); mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
@@ -250,37 +316,15 @@ sub_set_preference() {
 }
 
 sub_check_ports() {
-    clear
-    echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
-    echo -e "${GRAY}Local/Foreign 地址部分保持紫色/灰色，PID Name 部分高亮绿色${RESET}"
-    echo -e "${PURPLE}Proto Recv-Q Send-Q Local Address           Foreign Address         State       ${RESET}${YELLOW}PID/Program name${RESET}"
-    echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
-    
-    # 关键修改：使用 bash 字符串替换，精准高亮 shoes-core，不影响前面
-    ss -tulpn | grep -E "^(udp|tcp)" | while read -r line; do
-        # 统一把前面的部分设为淡紫色/灰色
-        local colored_line="${PURPLE}${line}${RESET}"
-        
-        # 如果包含 shoes-core，把这个关键词换成亮绿色，并重置回紫色或结束颜色
-        if [[ "$line" == *"shoes-core"* ]]; then
-            # 替换 shoes-core 为 绿色shoes-core，注意 sed 这里只替换匹配到的部分
-            # 使用 echo 输出，将 shoes-core 替换为带颜色的版本
-            echo -e "${PURPLE}${line//shoes-core/${GREEN}shoes-core${PURPLE}}${RESET}"
-        else
-            echo -e "${PURPLE}${line}${RESET}"
-        fi
-    done
-    
-    echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
-    echo -e "未见 ${GREEN}shoes-core${RESET} 则服务未启动"
-    echo ""
-    read -rp "按回车返回..." _
+    clear; echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
+    ss -tulpn | grep -E "^(udp|tcp)" | sed --unbuffered "s/shoes-core/${GREEN}shoes-core${RESET}/g"
+    echo -e "\n${GRAY}未见绿色 shoes-core 则服务未启动${RESET}"; read -rp "..." _
 }
 
 menu_advanced_network() {
     while true; do
         clear; echo -e "${CYAN}=== 高级网络设置 ===${RESET}"
-        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听 (美化版)\n${GREEN}[0]${RESET} 返回"
+        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听\n${GREEN}[0]${RESET} 返回"
         read -rp "选择: " c
         case "$c" in 1) sub_switch_ipv6_exit;; 2) sub_set_preference;; 3) sub_check_ports;; 0) return;; esac
     done
@@ -289,7 +333,7 @@ menu_advanced_network() {
 # ================== 主菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V32.0 端口显示美化版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V31.0 NAT专用版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (随机端口)"
