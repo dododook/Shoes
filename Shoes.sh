@@ -1,237 +1,97 @@
 #!/bin/bash
-set -euo pipefail
 
 # ================== 颜色代码 ==================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
 RESET='\033[0m'
 
 # ================== 常量定义 ==================
 SHOES_BIN="/usr/local/bin/shoes"
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
-SHOES_LINK_FILE="${SHOES_CONF_DIR}/config.txt"
-SYSTEMD_FILE="/etc/systemd/system/shoes.service"
-TMP_DIR="/tmp/shoesdl"
-
-# ================== Root 检查 ==================
-require_root() {
-  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    echo -e "${RED}必须使用 root 权限运行此脚本！${RESET}"
-    exit 1
-  fi
-}
+SHOES_SERVICE="/etc/systemd/system/shoes.service"
+LINK_FILE="/root/proxy_links.txt"
+TMP_DIR="/tmp/proxydl"
 
 # ================== 依赖检查 ==================
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo -e "${RED}缺少依赖: ${YELLOW}$1${RESET}"
-    exit 1
-  }
-}
-
-check_deps() {
-  need_cmd curl
-  need_cmd wget
-  need_cmd tar
-  need_cmd openssl
-  need_cmd systemctl
-  need_cmd awk
-  need_cmd sed
-  need_cmd grep
-  need_cmd uname
-  need_cmd shuf
-  need_cmd base64
-}
-
-# ================== glibc / musl 检测 ==================
-get_libc_info() {
-  # 默认值
-  LIBC_KIND="glibc"
-  GLIBC_VERSION=""
-  GLIBC_MAJOR=0
-  GLIBC_MINOR=0
-
-  if ! command -v ldd >/dev/null 2>&1; then
-    # 极端情况：没有 ldd，保守用 musl 版
-    LIBC_KIND="unknown"
-    echo -e "${YELLOW}未找到 ldd，无法判断 libc，后续将优先使用 MUSL 版本${RESET}"
-    return
-  fi
-
-  local ldd_out
-  ldd_out="$(ldd --version 2>&1 | head -n1 || true)"
-
-  if echo "$ldd_out" | grep -qi "musl"; then
-    LIBC_KIND="musl"
-    echo -e "${GREEN}系统 libc：${YELLOW}musl${RESET}"
-    return
-  fi
-
-  # glibc 常见输出：ldd (Debian GLIBC 2.36-9+deb12u4) 2.36
-  GLIBC_VERSION="$(echo "$ldd_out" | awk '{print $NF}' | tr -d '()' || true)"
-  if [[ -n "${GLIBC_VERSION}" && "${GLIBC_VERSION}" =~ ^[0-9]+\.[0-9]+ ]]; then
-    GLIBC_MAJOR="$(echo "$GLIBC_VERSION" | cut -d. -f1)"
-    GLIBC_MINOR="$(echo "$GLIBC_VERSION" | cut -d. -f2)"
-    echo -e "${GREEN}系统 libc：${YELLOW}glibc ${GLIBC_VERSION}${RESET}"
-  else
-    LIBC_KIND="unknown"
-    echo -e "${YELLOW}无法解析 glibc 版本，后续将优先使用 MUSL 版本${RESET}"
-  fi
+install_dependencies() {
+    if command -v apt >/dev/null; then
+        apt update && apt install -y curl wget tar openssl jq
+    elif command -v yum >/dev/null; then
+        yum install -y curl wget tar openssl jq
+    fi
 }
 
 # ================== 架构检测 ==================
 check_arch() {
-  case "$(uname -m)" in
-    x86_64)
-      GNU_FILE="shoes-x86_64-unknown-linux-gnu.tar.gz"
-      MUSL_FILE="shoes-x86_64-unknown-linux-musl.tar.gz"
-      ;;
-    aarch64|arm64)
-      GNU_FILE="shoes-aarch64-unknown-linux-gnu.tar.gz"
-      MUSL_FILE="shoes-aarch64-unknown-linux-musl.tar.gz"
-      ;;
-    *)
-      echo -e "${RED}不支持的 CPU 架构：$(uname -m)${RESET}"
-      exit 1
-      ;;
-  esac
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) SHOES_ARCH="x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) SHOES_ARCH="aarch64-unknown-linux-gnu" ;;
+        *) echo -e "${RED}不支持的架构: ${ARCH}${RESET}"; exit 1 ;;
+    esac
 }
 
-# ================== 最新版本 ==================
-get_latest_version() {
-  LATEST_VER="$(curl -s https://api.github.com/repos/cfal/shoes/releases/latest \
-    | grep '"tag_name":' \
-    | sed -E 's/.*"v?([^"]+)".*/\1/' || true)"
-  if [[ -z "${LATEST_VER}" ]]; then
-    echo -e "${RED}无法获取 Shoes 最新版本！${RESET}"
-    exit 1
-  fi
-  echo -e "${GREEN}Shoes 最新版本：${YELLOW}v${LATEST_VER}${RESET}"
+# ================== 获取 IP ==================
+get_public_ip() {
+    curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}'
 }
 
-# ================== 运行测试 ==================
-test_shoes_binary() {
-  "${SHOES_BIN}" generate-reality-keypair >/dev/null 2>&1
-}
-
-# ================== 下载并安装 Shoes ==================
-download_shoes() {
-  check_arch
-  get_latest_version
-  get_libc_info
-
-  local DOWNLOAD_FILE DOWNLOAD_TYPE DOWNLOAD_URL
-
-  # 选择 GNU / MUSL
-  if [[ "${LIBC_KIND}" == "musl" || "${LIBC_KIND}" == "unknown" ]]; then
-    echo -e "${GREEN}优先使用 MUSL 版本${RESET}"
-    DOWNLOAD_FILE="${MUSL_FILE}"
-    DOWNLOAD_TYPE="MUSL"
-  else
-    # glibc >= 2.38 才优先 GNU，否则用 MUSL
-    if (( GLIBC_MAJOR < 2 )) || (( GLIBC_MAJOR == 2 && GLIBC_MINOR < 38 )); then
-      echo -e "${GREEN}glibc < 2.38，使用 MUSL 版本${RESET}"
-      DOWNLOAD_FILE="${MUSL_FILE}"
-      DOWNLOAD_TYPE="MUSL"
-    else
-      echo -e "${GREEN}glibc >= 2.38，优先 GNU 版本${RESET}"
-      DOWNLOAD_FILE="${GNU_FILE}"
-      DOWNLOAD_TYPE="GNU"
-    fi
-  fi
-
-  mkdir -p "${TMP_DIR}"
-  cd "${TMP_DIR}" || exit 1
-
-  DOWNLOAD_URL="https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${DOWNLOAD_FILE}"
-  echo -e "${GREEN}下载 ${DOWNLOAD_TYPE}: ${CYAN}${DOWNLOAD_URL}${RESET}"
-
-  if ! wget -O shoes.tar.gz "$DOWNLOAD_URL"; then
-    if [[ "$DOWNLOAD_TYPE" == "GNU" ]]; then
-      echo -e "${YELLOW}GNU 下载失败，尝试 MUSL${RESET}"
-      DOWNLOAD_URL="https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
-      wget -O shoes.tar.gz "$DOWNLOAD_URL"
-      DOWNLOAD_TYPE="MUSL"
-    else
-      echo -e "${RED}MUSL 下载失败${RESET}"
-      exit 1
-    fi
-  fi
-
-  tar -xzf shoes.tar.gz
-  if [[ ! -f "shoes" ]]; then
-    echo -e "${RED}解压后未找到 shoes 二进制文件${RESET}"
-    exit 1
-  fi
-
-  mv -f shoes "${SHOES_BIN}"
-  chmod +x "${SHOES_BIN}"
-
-  if test_shoes_binary; then
-    echo -e "${GREEN}(${DOWNLOAD_TYPE}) 正常运行${RESET}"
-    return 0
-  fi
-
-  # GNU 可能因 glibc 不匹配而无法运行，再切 MUSL 兜底
-  if [[ "$DOWNLOAD_TYPE" == "GNU" ]]; then
-    echo -e "${YELLOW}GNU 无法运行，切换 MUSL 版本兜底${RESET}"
-    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
-    tar -xzf shoes.tar.gz
-    mv -f shoes "${SHOES_BIN}"
-    chmod +x "${SHOES_BIN}"
-    if test_shoes_binary; then
-      echo -e "${GREEN}(MUSL) 正常运行${RESET}"
-      return 0
-    fi
-    echo -e "${RED}MUSL 仍无法运行，安装失败${RESET}"
-    exit 1
-  fi
-
-  echo -e "${RED}安装失败：二进制无法运行${RESET}"
-  exit 1
-}
-
-# ================== 获取公网 IPv4（简单版） ==================
-get_public_ipv4() {
-  curl -s -4 https://api64.ipify.org 2>/dev/null || true
-}
-
-# ================== 安装 ==================
+# ================== 安装 Shoes (集成 SS) ==================
 install_shoes() {
-  echo -e "${GREEN}开始安装 Shoes + VLESS/Reality + AnyTLS + Shadowsocks(2022)${RESET}"
-  download_shoes
-  mkdir -p "${SHOES_CONF_DIR}"
+    echo -e "${GREEN}>>> 开始安装 Shoes (集成 Shadowsocks)...${RESET}"
+    install_dependencies
+    check_arch
+    
+    # 1. 获取版本 & 下载
+    SHOES_VER=$(curl -s https://api.github.com/repos/cfal/shoes/releases/latest | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    [[ -z "$SHOES_VER" ]] && { echo -e "${RED}获取 Shoes 版本失败${RESET}"; return; }
+    
+    mkdir -p "${TMP_DIR}"
+    cd "${TMP_DIR}" || exit 1
+    
+    SHOES_URL="https://github.com/cfal/shoes/releases/download/v${SHOES_VER}/shoes-${SHOES_ARCH}.tar.gz"
+    echo -e "下载: $SHOES_URL"
+    wget -O shoes.tar.gz "$SHOES_URL" || { echo -e "${RED}下载失败${RESET}"; return; }
+    
+    tar -xzf shoes.tar.gz
+    FIND_SHOES=$(find . -type f -name "shoes" | head -n 1)
+    if [[ -z "$FIND_SHOES" ]]; then
+        echo -e "${RED}解压后未找到 shoes 二进制文件${RESET}"; return;
+    fi
+    cp "$FIND_SHOES" "${SHOES_BIN}"
+    chmod +x "${SHOES_BIN}"
 
-  # ------- VLESS/Reality -------
-  SNI="www.ua.edu"
-  SHID="$(openssl rand -hex 8)"
-  VLESS_PORT="$(shuf -i 20000-60000 -n 1)"
-  UUID="$(cat /proc/sys/kernel/random/uuid)"
+    # 2. 生成配置参数
+    mkdir -p "${SHOES_CONF_DIR}"
+    
+    # --- VLESS Reality 参数 ---
+    SNI="www.ua.edu"
+    SHID=$(openssl rand -hex 8)
+    VLESS_PORT=$(shuf -i 20001-30000 -n 1)
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+    
+    # 生成 Reality 密钥对
+    KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
+    PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
+    PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
 
-  KEYPAIR="$("${SHOES_BIN}" generate-reality-keypair)"
-  PRIVATE_KEY="$(echo "$KEYPAIR" | awk '/private key/ {print $4}')"
-  PUBLIC_KEY="$(echo "$KEYPAIR"  | awk '/public key/  {print $4}')"
+    # --- AnyTLS 参数 ---
+    ANYTLS_PORT=$(shuf -i 30001-40000 -n 1)
+    
+    # --- Shadowsocks 参数 (新增) ---
+    SS_PORT=$(shuf -i 40001-50000 -n 1)
+    SS_METHOD="aes-256-gcm"
+    SS_PASSWORD=$(openssl rand -base64 16)
 
-  # ------- AnyTLS（TLS + 自签证书）-------
-  ANYTLS_PORT="$(shuf -i 20000-60000 -n 1)"
-  ANYTLS_PWD="$(openssl rand -base64 18 | tr -d '=+/')"
+    # 生成自签名证书 (AnyTLS用)
+    openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
+    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
 
-  openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-  openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" \
-    -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
-
-  # ------- Shadowsocks 2022 -------
-  SS_PORT="$(shuf -i 20000-60000 -n 1)"
-  SS_CIPHER="2022-blake3-aes-256-gcm"
-  # 用 shoes 自带命令生成 2022 密码/PSK
-  SS_PSK="$("${SHOES_BIN}" generate-shadowsocks-2022-password "${SS_CIPHER}")"
-
-  # ------- 写配置 -------
-  cat > "${SHOES_CONF_FILE}" <<EOF
+    # 3. 写入配置文件 (集成 SS)
+    # ⚠️ 注意: 这里假设 Shoes 的 SS 配置格式是标准的 protocol: type: shadowsocks
+    cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
     type: tls
@@ -245,7 +105,6 @@ install_shoes() {
           type: vless
           user_id: "${UUID}"
           udp_enabled: true
-
 - address: "0.0.0.0:${ANYTLS_PORT}"
   protocol:
     type: tls
@@ -256,20 +115,19 @@ install_shoes() {
         protocol:
           type: anytls
           users:
-            - name: anytls
-              password: "${ANYTLS_PWD}"
+            - name: anylts
+              password: "${PUBLIC_KEY}"
           udp_enabled: true
-
 - address: "0.0.0.0:${SS_PORT}"
   protocol:
     type: shadowsocks
-    cipher: ${SS_CIPHER}
-    password: "${SS_PSK}"
+    method: "${SS_METHOD}"
+    password: "${SS_PASSWORD}"
     udp_enabled: true
 EOF
 
-  # ------- systemd -------
-  cat > "${SYSTEMD_FILE}" <<EOF
+    # 4. Systemd 服务
+    cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
 After=network.target
@@ -277,93 +135,101 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=${SHOES_CONF_DIR}
 ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
-Restart=always
-RestartSec=1
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now shoes
-  systemctl --no-pager status shoes || true
-
-  # ------- 输出链接 -------
-  HOST_IP="$(get_public_ipv4)"
-  if [[ -z "${HOST_IP}" ]]; then
-    HOST_IP="YOUR_SERVER_IP"
-  fi
-  COUNTRY="$( [ "${HOST_IP}" != "YOUR_SERVER_IP" ] && curl -s "https://ipinfo.io/${HOST_IP}/country" 2>/dev/null || echo "ZZ" )"
-
-  # SS URI：ss://BASE64(method:password)@host:port#tag
-  SS_USERINFO_B64="$(printf "%s:%s" "${SS_CIPHER}" "${SS_PSK}" | base64 -w 0)"
-
-  cat > "${SHOES_LINK_FILE}" <<EOF
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${COUNTRY}
-anytls://${ANYTLS_PWD}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=www.bing.com&allowInsecure=1&type=tcp#${COUNTRY}
-ss://${SS_USERINFO_B64}@${HOST_IP}:${SS_PORT}#${COUNTRY}-SS2022
-EOF
-
-  echo -e "${GREEN}Shoes 安装完成！${RESET}"
-  echo -e "${CYAN}配置文件：${SHOES_CONF_FILE}${RESET}"
-  echo -e "${CYAN}链接文件：${SHOES_LINK_FILE}${RESET}"
-  echo ""
-  cat "${SHOES_LINK_FILE}"
+    systemctl daemon-reload
+    systemctl enable --now shoes
+    echo -e "${GREEN}Shoes (含SS) 安装完成！${RESET}"
+    
+    # 5. 生成并保存链接
+    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_METHOD"
 }
 
-# ================== 卸载 ==================
-uninstall_shoes() {
-  systemctl stop shoes >/dev/null 2>&1 || true
-  systemctl disable shoes >/dev/null 2>&1 || true
-  rm -f "${SYSTEMD_FILE}"
-  rm -rf "${SHOES_CONF_DIR}"
-  rm -f "${SHOES_BIN}"
-  systemctl daemon-reload
-  echo -e "${GREEN}Shoes 已卸载${RESET}"
-}
+# ================== 生成链接函数 ==================
+generate_links_content() {
+    # 接收参数
+    local uuid=$1
+    local vless_port=$2
+    local sni=$3
+    local pbk=$4
+    local sid=$5
+    local ss_port=$6
+    local ss_pass=$7
+    local ss_method=$8
+    
+    HOST_IP=$(get_public_ip)
+    
+    # VLESS Link
+    VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_Reality"
 
-# ================== 状态 ==================
-check_installed() { command -v shoes >/dev/null 2>&1 || [[ -x "${SHOES_BIN}" ]]; }
-check_running() { systemctl is-active --quiet shoes; }
+    # SS Link (Base64编码 method:password)
+    SS_BASE=$(echo -n "${ss_method}:${ss_pass}" | base64 -w 0)
+    SS_LINK="ss://${SS_BASE}@${HOST_IP}:${ss_port}#Shoes_SS"
+
+    echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
+    
+    echo -e "\n--- VLESS Reality ---" | tee -a "${LINK_FILE}"
+    echo -e "链接: ${GREEN}${VLESS_LINK}${RESET}" | tee -a "${LINK_FILE}"
+
+    echo -e "\n--- Shadowsocks ---" | tee -a "${LINK_FILE}"
+    echo -e "端口: ${ss_port}" | tee -a "${LINK_FILE}"
+    echo -e "密码: ${ss_pass}" | tee -a "${LINK_FILE}"
+    echo -e "加密: ${ss_method}" | tee -a "${LINK_FILE}"
+    echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
+}
 
 # ================== 菜单 ==================
 show_menu() {
-  clear
-  echo -e "${GREEN}=== Shoes 管理工具 (VLESS/Reality + AnyTLS + SS2022) ===${RESET}"
-  echo -e "安装状态: $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${RED}未安装${RESET}")"
-  echo -e "运行状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
-  echo ""
-  echo "1. 安装 Shoes 服务"
-  echo "2. 卸载 Shoes 服务"
-  echo "3. 启动 Shoes 服务"
-  echo "4. 停止 Shoes 服务"
-  echo "5. 重启 Shoes 服务"
-  echo "6. 查看 Shoes 链接"
-  echo "7. 查看 Shoes 日志"
-  echo "0. 退出"
-  echo -e "${GREEN}===============================================${RESET}"
-  echo ""
-  read -r -p "请输入选项: " choice
+    clear
+    echo -e "${GREEN}=== Shoes 一键管理脚本 (VLESS + SS) ===${RESET}"
+    
+    if systemctl is-active --quiet shoes; then
+        echo -e "运行状态: ${GREEN}运行中${RESET}"
+    else
+        echo -e "运行状态: ${RED}未运行${RESET}"
+    fi
+
+    echo "------------------------"
+    echo "1. 安装 / 重置 Shoes 服务"
+    echo "2. 停止服务"
+    echo "3. 重启服务"
+    echo "4. 查看当前链接"
+    echo "5. 卸载服务"
+    echo "0. 退出"
+    echo "------------------------"
+    read -p "请输入选项: " choice
 }
 
-# ================== 主循环 ==================
-require_root
-check_deps
+# ================== 主逻辑 ==================
+check_arch
 
 while true; do
-  show_menu
-  case "${choice}" in
-    1) install_shoes ;;
-    2) uninstall_shoes ;;
-    3) systemctl start shoes ;;
-    4) systemctl stop shoes ;;
-    5) systemctl restart shoes ;;
-    6) [[ -f "${SHOES_LINK_FILE}" ]] && cat "${SHOES_LINK_FILE}" || echo -e "${YELLOW}未找到链接文件：${SHOES_LINK_FILE}${RESET}" ;;
-    7) journalctl -u shoes -f ;;
-    0) exit 0 ;;
-    *) echo -e "${RED}无效选项！${RESET}" ;;
-  esac
-  read -r -p "按 Enter 继续..."
+    show_menu
+    case "$choice" in
+        1) install_shoes ;;
+        2) systemctl stop shoes; echo "已停止" ;;
+        3) systemctl restart shoes; echo "已重启" ;;
+        4) 
+            if [[ -f "${LINK_FILE}" ]]; then
+                cat "${LINK_FILE}"
+            else
+                echo -e "${RED}无链接记录，请先安装。${RESET}"
+            fi 
+            ;;
+        5)
+            systemctl stop shoes
+            systemctl disable shoes
+            rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}"
+            systemctl daemon-reload
+            echo -e "${GREEN}卸载完成${RESET}"
+            ;;
+        0) exit 0 ;;
+        *) echo "无效选项" ;;
+    esac
+    read -p "按回车继续..."
 done
