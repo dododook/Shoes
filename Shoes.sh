@@ -23,12 +23,26 @@ SHOES_SERVICE="/etc/systemd/system/shoes.service"
 LINK_FILE="/root/proxy_links.txt"
 TMP_DIR="/tmp/proxydl"
 
-# ================== 依赖检查 ==================
+# ================== 依赖检查与安装 ==================
 install_dependencies() {
     if command -v apt >/dev/null; then
-        apt update && apt install -y curl wget tar openssl jq iproute2 iptables sed
+        apt update -q && apt install -y -q curl wget tar openssl jq iproute2 iptables sed
     elif command -v yum >/dev/null; then
-        yum install -y curl wget tar openssl jq iproute iptables sed
+        yum install -y -q curl wget tar openssl jq iproute iptables sed
+    fi
+}
+
+check_and_install_deps() {
+    local need_install=0
+    if ! command -v jq >/dev/null; then need_install=1; fi
+    if ! command -v curl >/dev/null; then need_install=1; fi
+    if ! command -v iptables >/dev/null; then need_install=1; fi
+    
+    if [ "$need_install" -eq 1 ]; then
+        echo -e "${YELLOW}>>> 检测到系统缺失必要依赖，正在自动补全...${RESET}"
+        install_dependencies
+        echo -e "${GREEN}>>> 依赖补全完成！${RESET}"
+        sleep 1
     fi
 }
 
@@ -53,15 +67,10 @@ create_shortcut() {
     if [[ -f "$current_file" && ! -L "$current_file" && "$0" != "-bash" ]]; then
         cp -f "$current_file" "$MENU_BIN"
         chmod +x "$MENU_BIN"
-        echo -e "${GREEN}>>> 快捷指令安装成功！以后输入 'sho' 即可使用。${RESET}"
     else
-        echo -e "${YELLOW}>>> 检测到非本地文件运行，正在尝试从 GitHub 拉取以安装快捷键...${RESET}"
         if curl -s --head --request GET "$SCRIPT_URL" | grep "200 OK" > /dev/null; then
             curl -sL "$SCRIPT_URL" -o "$MENU_BIN"
             chmod +x "$MENU_BIN"
-            echo -e "${GREEN}>>> 快捷指令已从 GitHub 恢复。${RESET}"
-        else
-            echo -e "${RED}⚠️  无法创建快捷指令 'sho'。${RESET}"
         fi
     fi
     if [[ -f "/usr/bin/shoes" ]]; then rm -f "/usr/bin/shoes"; fi
@@ -116,7 +125,7 @@ ask_port() {
 # ================== 安装/重置 Shoes ==================
 install_shoes() {
     local mode=$1
-    install_dependencies
+    check_and_install_deps
     download_shoes_core
     if [[ $? -ne 0 ]]; then return; fi
 
@@ -230,9 +239,11 @@ sub_switch_ipv6_exit() {
         local addr=${item%/*}; local status_mark=""
         if [[ "$addr" == "$current_exit_ip" ]]; then status_mark="${GREEN}✔${RESET} ${YELLOW}(当前默认)${RESET}"; else status_mark="${GRAY}(可选)${RESET}"; fi
         local loc_str=""; if command -v curl >/dev/null; then local api=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city"); if [[ -n "$api" ]]; then local c=$(echo "$api"|jq -r '.country//empty'); local t=$(echo "$api"|jq -r '.city//empty'); [[ -n "$c" ]] && loc_str="${BLUE}[${c} ${t}]${RESET}"; fi; fi
-        echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${status_mark}"; ((i++))
+        local lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
+        local lat_str=""; if [[ -n "$lat_val" ]]; then local lat_num=${lat_val%.*}; if [[ "$lat_num" -lt 100 ]]; then lat_str="${GREEN}[${lat_val}ms]${RESET}"; elif [[ "$lat_num" -lt 200 ]]; then lat_str="${YELLOW}[${lat_val}ms]${RESET}"; else lat_str="${RED}[${lat_val}ms]${RESET}"; fi; else lat_str="${RED}[超时]${RESET}"; fi
+        echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"; ((i++))
     done
-    echo -e " ${GREEN}[0]${RESET} 返回"; read -rp "选择: " choice; [[ "$choice" == "0" || -z "$choice" ]] && return
+    echo -e " ${GREEN}[0]${RESET} 取消返回"; read -rp "选择: " choice; [[ "$choice" == "0" || -z "$choice" ]] && return
     local target=${ip_with_prefix[$((choice-1))]}
     local dev=$(ip -6 route show default|awk '/dev/{print $5}'|head -n1); [[ -z "$dev" ]] && dev="eth0"
     for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev" preferred_lft 0 >/dev/null 2>&1; done
@@ -255,10 +266,7 @@ sub_check_ports() {
     echo -e "${GRAY}重点关注 Process 为 ${GREEN}shoes-core${RESET}${GRAY} 的行，那些就是你的代理端口。${RESET}"
     echo -e "${YELLOW}Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name${RESET}"
     echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
-    
-    # === 关键修正：不再整行变色，只替换 shoes-core 为亮绿色，其他保持原样 ===
     ss -tulpn | grep -E "^(udp|tcp)" | sed --unbuffered "s/shoes-core/${GREEN}shoes-core${RESET}/g"
-    
     echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
     echo -e "未见 ${GREEN}shoes-core${RESET} 则服务未启动"
     echo ""
@@ -274,28 +282,34 @@ menu_advanced_network() {
     done
 }
 
+# ================== 辅助功能 ==================
+update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core; if [[ $? -eq 0 ]]; then systemctl restart shoes; echo -e "${GREEN}更新成功${RESET}"; fi }
+enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
+view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoes -f; }
+
 # ================== 主菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V33.0 完美高亮版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V35.0 菜单重排版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (随机端口)"
-    echo "2. 停止服务"
-    echo "3. 重启服务"
-    echo "4. 查看所有链接"
-    echo "5. 卸载服务"
+    echo -e "${RED}2. 自定义端口重装 (NAT/高级专用)${RESET}"
+    echo "3. 停止服务"
+    echo "4. 重启服务"
+    echo "5. 查看所有链接"
+    echo "6. 卸载服务"
     echo "------------------------"
-    echo -e "${CYAN}6. 高级网络设置 (IPv6 / 优先级 / 端口)${RESET}"
-    echo -e "${YELLOW}7. 开启 BBR 加速 (优化网络速度)${RESET}"
-    echo -e "${BLUE}8. 更新 Shoes 内核 (保留配置文件)${RESET}"
+    echo -e "${CYAN}7. 高级网络设置 (IPv6 / 优先级 / 端口)${RESET}"
+    echo -e "${YELLOW}8. 开启 BBR 加速 (优化网络速度)${RESET}"
+    echo -e "${BLUE}9. 更新 Shoes 内核 (保留配置文件)${RESET}"
     echo "------------------------"
-    echo -e "${GRAY}9. 查看实时日志${RESET}"
-    echo -e "${RED}10. 自定义端口重装 (NAT/高级专用)${RESET}"
+    echo -e "${GRAY}10. 查看实时日志${RESET}"
     echo "0. 退出"
     read -p "选项: " choice
 }
 
+check_and_install_deps
 create_shortcut
 check_arch
 
@@ -303,15 +317,15 @@ while true; do
     show_menu
     case "$choice" in
         1) install_shoes "random" ;;
-        2) systemctl stop shoes; echo "停用";; 
-        3) systemctl restart shoes; echo "重启";;
-        4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
-        5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/sho" "/usr/bin/sho"; systemctl daemon-reload; echo "卸载完毕";;
-        6) menu_advanced_network ;;
-        7) enable_bbr ;;       
-        8) update_shoes_only ;; 
-        9) view_realtime_log ;;
-        10) install_shoes "custom" ;;
+        2) install_shoes "custom" ;;
+        3) systemctl stop shoes; echo "停用";; 
+        4) systemctl restart shoes; echo "重启";;
+        5) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
+        6) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/sho" "/usr/bin/sho"; systemctl daemon-reload; echo "卸载完毕";;
+        7) menu_advanced_network ;;
+        8) enable_bbr ;;       
+        9) update_shoes_only ;; 
+        10) view_realtime_log ;;
         0) exit 0 ;;
         *) echo "无效" ;;
     esac
