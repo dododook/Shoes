@@ -5,12 +5,13 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m' # 你的粉紫色回来啦
+PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 GRAY='\033[0;90m'
 RESET='\033[0m'
 
 # ================== 常量定义 ==================
+SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
 SHOES_BIN="/usr/local/bin/shoes"
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
@@ -43,9 +44,14 @@ get_public_ip() {
     curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}'
 }
 
-# ================== 快捷指令 ==================
+# ================== 快捷指令 (修复版) ==================
 create_shortcut() {
-    cp -f "$CURRENT_SCRIPT_PATH" /usr/local/bin/shoes-menu
+    if [[ -f "$0" && ! -L "$0" ]]; then
+        cp -f "$0" /usr/local/bin/shoes-menu
+    else
+        echo -e "${GREEN}>>> 检测到在线运行，正在下载脚本以创建快捷指令...${RESET}"
+        curl -sL "$SCRIPT_URL" -o /usr/local/bin/shoes-menu
+    fi
     chmod +x /usr/local/bin/shoes-menu
     ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes
 }
@@ -81,7 +87,7 @@ install_shoes() {
 
     mkdir -p "${SHOES_CONF_DIR}"
     
-    # 1. Reality (随机 SNI)
+    # 1. Reality
     SNI_LIST=("www.microsoft.com" "itunes.apple.com" "gateway.icloud.com" "www.amazon.com" "www.tesla.com" "dl.google.com" "www.yahoo.com")
     SNI=${SNI_LIST[$RANDOM % ${#SNI_LIST[@]}]}
     echo -e "${GREEN}>>> 随机伪装域名: ${YELLOW}${SNI}${RESET}"
@@ -93,10 +99,10 @@ install_shoes() {
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
 
-    # 2. AnyTLS
+    # 2. AnyTLS (现在使用 UUID 作为密码)
     ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
-    ANYTLS_USER="any"
-    ANYTLS_PASS=$(openssl rand -base64 8) 
+    ANYTLS_USER="anytls"
+    ANYTLS_PASS=$(cat /proc/sys/kernel/random/uuid) # 生成 UUID
 
     # 3. Shadowsocks (Legacy)
     SS_PORT=$(shuf -i 35001-40000 -n 1)
@@ -111,7 +117,7 @@ install_shoes() {
     # 5. SS-2022
     SS22_PORT=$(shuf -i 45001-55000 -n 1)
     SS22_CIPHER="2022-blake3-aes-256-gcm"
-    SS22_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password "${SS22_CIPHER}" | awk '{print $NF}')
+    SS22_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password "${SS22_CIPHER}" | grep -v "\-\-\-" | grep -v "${SS22_CIPHER}" | awk '{$1=$1;print}' | head -n 1)
 
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
@@ -205,6 +211,10 @@ generate_links_content() {
     SOCKS_LINK="socks5://${SOCKS_BASE}@${HOST_IP}:${socks_port}#Shoes_S5"
     SS22_BASE=$(echo -n "${ss22_cipher}:${ss22_pass}" | base64 -w 0)
     SS22_LINK="ss://${SS22_BASE}@${HOST_IP}:${ss22_port}#Shoes_2022"
+    
+    # AnyTLS Link (使用 UUID 格式)
+    # 格式: anytls://UUID@IP:PORT?security=tls&insecure=1&type=tcp#Remark
+    ANYTLS_LINK="anytls://${any_pass}@${HOST_IP}:${any_port}?security=tls&insecure=1&type=tcp#Shoes_AnyTLS"
 
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
     echo -e "\n--- [1] VLESS Reality (SNI: ${sni}) ---" | tee -a "${LINK_FILE}"
@@ -217,10 +227,10 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${SOCKS_LINK}${RESET}" | tee -a "${LINK_FILE}"
     echo -e "\n--- [5] AnyTLS (HTTPS Proxy) ---" | tee -a "${LINK_FILE}"
     echo -e "地址: ${HOST_IP}:${any_port}" | tee -a "${LINK_FILE}"
-    echo -e "用户: ${any_user} | 密码: ${any_pass}" | tee -a "${LINK_FILE}"
+    echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 高级 IPv6 切换 (1:1 视觉还原 + 智能检测) ==================
+# ================== 高级 IPv6 切换 (1:1 UI复刻版) ==================
 switch_system_ipv6() {
     clear
     echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
@@ -228,123 +238,44 @@ switch_system_ipv6() {
     echo -e "${GREEN}➜ ${RESET}正在进行 地区解析 与 延迟测试 (Cloudflare)..."
     echo -e "${GRAY}(如果 IP 较多，测试可能需要几秒钟，请耐心等待)${RESET}"
     echo ""
-    
-    # 1. 提取 IP
-    local ip_with_prefix=()
-    mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
-
-    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then
-        echo -e "${RED}未检测到可用的公网 IPv6 地址。${RESET}"
-        read -rp "按回车返回..." _
-        return
-    fi
-
-    # === 智能核心：获取真实的默认出口 IP ===
+    local ip_with_prefix=(); mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
+    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}未检测到可用的公网 IPv6 地址。${RESET}"; read -rp "按回车返回..." _; return; fi
     local current_exit_ip=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oP 'src \K\S+')
-    # ==================================
-    
     echo -e "${GREEN}请选择要设为默认出口的 IP:${RESET}\n"
-
-    local i=1
-    local ping_cmd="ping -6"
-    if ! command -v ping >/dev/null 2>&1; then ping_cmd="ping6"; fi
-
+    local i=1; local ping_cmd="ping -6"; command -v ping >/dev/null 2>&1 || ping_cmd="ping6"
     for item in "${ip_with_prefix[@]}"; do
-        local addr=${item%/*}
-        
-        # 状态标记逻辑 (融合了视觉与功能)
-        local status_mark=""
-        if [[ "$addr" == "$current_exit_ip" ]]; then
-            # 如果是默认出口，显示绿色的勾
-            status_mark="${GREEN}✔${RESET} ${YELLOW}(当前默认)${RESET}"
-        elif ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then
-            status_mark="${GRAY}(备用)${RESET}"
-        else
-            status_mark="${GRAY}(可选)${RESET}"
-        fi
-        
-        # 地区检测
-        local loc_str=""
-        if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-            local api_res
-            api_res=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city" 2>/dev/null)
-            if [[ -n "$api_res" ]]; then
-                local country=$(echo "$api_res" | jq -r '.country // empty')
-                local city=$(echo "$api_res" | jq -r '.city // empty')
-                [[ -n "$country" ]] && loc_str="${BLUE}[${country} ${city}]${RESET}" || loc_str="${GRAY}[未知]${RESET}"
-            else
-                loc_str="${GRAY}[超时]${RESET}"
-            fi
-        fi
-        
-        # 延迟检测
-        local lat_val
-        lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
-        local lat_str=""
-        if [[ -n "$lat_val" ]]; then
-            local lat_num=${lat_val%.*}
-            if [[ "$lat_num" -lt 100 ]]; then
-                lat_str="${GREEN}[${lat_val}ms]${RESET}"
-            elif [[ "$lat_num" -lt 200 ]]; then
-                lat_str="${YELLOW}[${lat_val}ms]${RESET}"
-            else
-                lat_str="${RED}[${lat_val}ms]${RESET}"
-            fi
-        else
-            lat_str="${RED}[超时]${RESET}"
-        fi
-
-        # 视觉核心：IP使用紫色(PURPLE)，完美复刻你的截图
-        echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"
-        ((i++))
+        local addr=${item%/*}; local status_mark=""
+        if [[ "$addr" == "$current_exit_ip" ]]; then status_mark="${GREEN}✔${RESET} ${YELLOW}(当前默认)${RESET}";
+        elif ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then status_mark="${GRAY}(备用)${RESET}";
+        else status_mark="${GRAY}(可选)${RESET}"; fi
+        local loc_str=""; if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then local api_res=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city" 2>/dev/null); if [[ -n "$api_res" ]]; then local country=$(echo "$api_res" | jq -r '.country // empty'); local city=$(echo "$api_res" | jq -r '.city // empty'); [[ -n "$country" ]] && loc_str="${BLUE}[${country} ${city}]${RESET}" || loc_str="${GRAY}[未知]${RESET}"; else loc_str="${GRAY}[超时]${RESET}"; fi; fi
+        local lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
+        local lat_str=""; if [[ -n "$lat_val" ]]; then local lat_num=${lat_val%.*}; if [[ "$lat_num" -lt 100 ]]; then lat_str="${GREEN}[${lat_val}ms]${RESET}"; elif [[ "$lat_num" -lt 200 ]]; then lat_str="${YELLOW}[${lat_val}ms]${RESET}"; else lat_str="${RED}[${lat_val}ms]${RESET}"; fi; else lat_str="${RED}[超时]${RESET}"; fi
+        echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"; ((i++))
     done
     echo -e " ${GREEN}[0]${RESET} 取消返回"
-    echo ""
-
-    read -rp "请输入序号 [0-$((i-1))]: " choice
+    echo ""; read -rp "请输入序号 [0-$((i-1))]: " choice
     [[ "$choice" == "0" || -z "$choice" ]] && return
-
     local target_item="${ip_with_prefix[$((choice-1))]}"
-    local target_ip="${target_item%/*}"
-    [[ -z "$target_ip" ]] && return
-
+    local target_ip="${target_item%/*}"; [[ -z "$target_ip" ]] && return
     echo -e "\n正在切换出口 IP 至: $target_ip ..."
-    
     local gateway=$(ip -6 route show default | awk '/via/ {print $3}' | head -n1)
-    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1)
-    [[ -z "$dev_name" ]] && dev_name="eth0"
-
-    for item in "${ip_with_prefix[@]}"; do
-        ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1
-    done
+    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1); [[ -z "$dev_name" ]] && dev_name="eth0"
+    for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1; done
     ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
-
-    if [[ -n "$gateway" ]]; then
-        ip -6 route replace default via "$gateway" dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1
-    else
-        ip -6 route replace default dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1
-    fi
-    
-    echo -e "${GREEN}切换成功！${RESET}"
-    read -rp "按回车继续..." _
+    if [[ -n "$gateway" ]]; then ip -6 route replace default via "$gateway" dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1; else ip -6 route replace default dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1; fi
+    echo -e "${GREEN}切换成功！${RESET}"; read -rp "按回车继续..." _
 }
 
 # ================== 辅助功能 ==================
-update_shoes_only() {
-    echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core
-    if [[ $? -eq 0 ]]; then systemctl restart shoes; echo -e "${GREEN}更新成功${RESET}"; fi
-}
-enable_bbr() {
-    if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _
-}
+update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core; if [[ $? -eq 0 ]]; then systemctl restart shoes; echo -e "${GREEN}更新成功${RESET}"; fi }
+enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
 view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoes -f; }
 
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V15.0 颜值巅峰版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V18.0 AnyTLS修正版) ===${RESET}"
     echo -e "${GRAY}输入 'shoes' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
