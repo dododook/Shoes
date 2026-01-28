@@ -114,11 +114,11 @@ install_shoes() {
     open_port "$VLESS_PORT" "tcp"
     open_port "$VLESS_PORT" "udp"
 
-    # === 2. AnyTLS (关键修复: 明确定义 SNI) ===
+    # === 2. AnyTLS (保留 SNI 修复) ===
     ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
     ANYTLS_USER="anytls"
-    ANYTLS_PASS=$(openssl rand -hex 6)
-    ANYTLS_SNI="www.bing.com" # 明确指定 AnyTLS 的 SNI
+    ANYTLS_PASS=$(openssl rand -hex 8) # 随机密码更安全
+    ANYTLS_SNI="www.bing.com"
     open_port "$ANYTLS_PORT" "tcp"
 
     # === 3. Shadowsocks (Legacy) ===
@@ -128,25 +128,18 @@ install_shoes() {
     open_port "$SS_PORT" "tcp"
     open_port "$SS_PORT" "udp"
 
-    # === 4. SOCKS5 ===
-    SOCKS_PORT=$(shuf -i 40001-45000 -n 1)
-    SOCKS_USER="socks"
-    SOCKS_PASS=$(openssl rand -hex 6)
-    open_port "$SOCKS_PORT" "tcp"
-    open_port "$SOCKS_PORT" "udp"
-
-    # === 5. SS-2022 ===
+    # === 4. SS-2022 (保留 OpenSSL 修复) ===
     SS22_PORT=$(shuf -i 45001-55000 -n 1)
     SS22_CIPHER="2022-blake3-aes-256-gcm"
     SS22_PASSWORD=$(openssl rand -base64 32)
     open_port "$SS22_PORT" "tcp"
     open_port "$SS22_PORT" "udp"
 
-    # 证书生成 (CN 必须匹配 ANYTLS_SNI)
+    # 证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}"
 
-    # 写入配置
+    # 写入配置 (去除了 SOCKS5)
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -180,13 +173,6 @@ install_shoes() {
     cipher: "${SS_CIPHER}"
     password: "${SS_PASSWORD}"
     udp_enabled: true
-- address: "0.0.0.0:${SOCKS_PORT}"
-  protocol:
-    type: socks5
-    users:
-      - username: "${SOCKS_USER}"
-        password: "${SOCKS_PASS}"
-    udp_enabled: true
 - address: "0.0.0.0:${SS22_PORT}"
   protocol:
     type: shadowsocks
@@ -214,9 +200,9 @@ EOF
     systemctl daemon-reload
     systemctl enable --now shoes
     create_shortcut
-    echo -e "${GREEN}Shoes (5协议) 安装完成！配置已修复。${RESET}"
+    echo -e "${GREEN}Shoes (4协议安全版) 安装完成！${RESET}"
     
-    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$ANYTLS_SNI" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
+    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$ANYTLS_SNI" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
 }
 
 # ================== 生成链接 ==================
@@ -224,19 +210,14 @@ generate_links_content() {
     local uuid=$1; local vless_port=$2; local sni=$3; local pbk=$4; local sid=$5
     local ss_port=$6; local ss_pass=$7; local ss_cipher=$8
     local any_port=$9; local any_user=${10}; local any_pass=${11}; local any_sni=${12}
-    local socks_port=${13}; local socks_user=${14}; local socks_pass=${15}
-    local ss22_port=${16}; local ss22_pass=${17}; local ss22_cipher=${18}
+    local ss22_port=${13}; local ss22_pass=${14}; local ss22_cipher=${15}
     HOST_IP=$(get_public_ip)
     
     VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_${sni}"
     SS_BASE=$(echo -n "${ss_cipher}:${ss_pass}" | base64 -w 0)
     SS_LINK="ss://${SS_BASE}@${HOST_IP}:${ss_port}#Shoes_Legacy"
-    SOCKS_BASE=$(echo -n "${socks_user}:${socks_pass}" | base64 -w 0)
-    SOCKS_LINK="socks5://${SOCKS_BASE}@${HOST_IP}:${socks_port}#Shoes_S5"
     SS22_BASE=$(echo -n "${ss22_cipher}:${ss22_pass}" | base64 -w 0)
     SS22_LINK="ss://${SS22_BASE}@${HOST_IP}:${ss22_port}#Shoes_2022"
-    
-    # 关键修复：AnyTLS 链接加上 &sni= 参数
     ANYTLS_LINK="anytls://${any_pass}@${HOST_IP}:${any_port}?security=tls&insecure=1&type=tcp&sni=${any_sni}#Shoes_AnyTLS"
 
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
@@ -246,11 +227,7 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${SS22_LINK}${RESET}" | tee -a "${LINK_FILE}"
     echo -e "\n--- [3] SS-Legacy (传统/游戏) ---" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
-    echo -e "\n--- [4] SOCKS5 (务必填写账号密码!) ---" | tee -a "${LINK_FILE}"
-    echo -e "端口: ${RED}${socks_port}${RESET}" | tee -a "${LINK_FILE}"
-    echo -e "用户: ${socks_user} | 密码: ${socks_pass}" | tee -a "${LINK_FILE}"
-    echo -e "链接: ${GREEN}${SOCKS_LINK}${RESET}" | tee -a "${LINK_FILE}"
-    echo -e "\n--- [5] AnyTLS (HTTPS Proxy) ---" | tee -a "${LINK_FILE}"
+    echo -e "\n--- [4] AnyTLS (HTTPS Proxy) ---" | tee -a "${LINK_FILE}"
     echo -e "端口: ${RED}${any_port}${RESET}" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
@@ -300,7 +277,7 @@ view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoe
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V25.0 链接修正版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V27.0 安全加固版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
