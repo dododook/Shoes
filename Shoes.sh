@@ -228,7 +228,7 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 网络设置子菜单 (IPv6 复刻版) ==================
+# ================== 网络设置子菜单 (IPv6 经典版) ==================
 sub_switch_ipv6_exit() {
     clear
     echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
@@ -236,21 +236,13 @@ sub_switch_ipv6_exit() {
     echo -e "${GREEN}➜ ${RESET}正在进行 地区解析 与 延迟测试 (Cloudflare)..."
     echo -e "${GRAY}(如果 IP 较多，测试可能需要几秒钟，请耐心等待)${RESET}"
     echo ""
-    
-    local ip_with_prefix=()
-    mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
+    local ip_with_prefix=(); mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
     if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}未检测到可用的公网 IPv6 地址。${RESET}"; read -rp "按回车返回..." _; return; fi
     local current_exit_ip=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oP 'src \K\S+')
     echo -e "${GREEN}请选择要设为默认出口的 IP:${RESET}\n"
-
-    local i=1
-    local ping_cmd="ping -6"
-    if ! command -v ping >/dev/null 2>&1; then ping_cmd="ping6"; fi
-
+    local i=1; local ping_cmd="ping -6"; command -v ping >/dev/null 2>&1 || ping_cmd="ping6"
     for item in "${ip_with_prefix[@]}"; do
-        local addr=${item%/*}
-        local status_mark=""
-        # 100% 还原图片2的格式
+        local addr=${item%/*}; local status_mark=""
         if [[ "$addr" == "$current_exit_ip" ]]; then status_mark="${GREEN}✔${RESET} ${YELLOW}(当前活跃)${RESET}";
         elif ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then status_mark="${GRAY}(备用)${RESET}";
         else status_mark="${GRAY}(可选)${RESET}"; fi
@@ -260,12 +252,10 @@ sub_switch_ipv6_exit() {
         echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"; ((i++))
     done
     echo -e " ${GREEN}[0]${RESET} 取消返回"
-    echo ""
-    read -rp "请输入序号 [0-$((i-1))]: " choice
+    echo ""; read -rp "请输入序号 [0-$((i-1))]: " choice
     [[ "$choice" == "0" || -z "$choice" ]] && return
     local target_item="${ip_with_prefix[$((choice-1))]}"
-    local target_ip="${target_item%/*}"
-    [[ -z "$target_ip" ]] && return
+    local target_ip="${target_item%/*}"; [[ -z "$target_ip" ]] && return
     echo -e "\n正在切换出口 IP 至: $target_ip ..."
     local gateway=$(ip -6 route show default | awk '/via/ {print $3}' | head -n1)
     local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1); [[ -z "$dev_name" ]] && dev_name="eth0"
@@ -284,23 +274,21 @@ sub_set_preference() {
     echo -e "${GREEN}设置完成${RESET}"; read -rp "..." _
 }
 
-# ================== 端口查询 (高亮修复版) ==================
+# ================== 端口查询 (V32 风格复刻版) ==================
 sub_check_ports() {
     clear
     echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
-    echo -e "${GRAY}重点关注 Process 为 ${GREEN}shoes-core${RESET}${GRAY} 的行，那些就是你的代理端口。${RESET}"
-    echo -e "${YELLOW}Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name${RESET}"
+    echo -e "${GRAY}Local/Foreign 地址部分保持紫色/灰色，PID Name 部分高亮绿色${RESET}"
+    echo -e "${PURPLE}Proto Recv-Q Send-Q Local Address           Foreign Address         State       ${RESET}${YELLOW}PID/Program name${RESET}"
     echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
     
-    # 使用 while read 确保整行读取，然后手动拼接颜色
-    ss -tulpn | grep -E "^(udp|tcp)" | while IFS= read -r line; do
-        # 统一紫色
-        local base_color="${PURPLE}${line}${RESET}"
-        # 替换关键词
+    # === 使用 V32 版本的字符串替换逻辑，确保整行紫色，只高亮 shoes-core ===
+    ss -tulpn | grep -E "^(udp|tcp)" | while read -r line; do
         if [[ "$line" == *"shoes-core"* ]]; then
+            # 整行紫色，将 shoes-core 替换为 绿色+shoes-core+紫色
             echo -e "${PURPLE}${line//shoes-core/${GREEN}shoes-core${PURPLE}}${RESET}"
         else
-            echo -e "${base_color}"
+            echo -e "${PURPLE}${line}${RESET}"
         fi
     done
     
@@ -313,7 +301,7 @@ sub_check_ports() {
 menu_advanced_network() {
     while true; do
         clear; echo -e "${CYAN}=== 高级网络设置 ===${RESET}"
-        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听 (高亮版)\n${GREEN}[0]${RESET} 返回"
+        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听 (美化版)\n${GREEN}[0]${RESET} 返回"
         read -rp "选择: " c
         case "$c" in 1) sub_switch_ipv6_exit;; 2) sub_set_preference;; 3) sub_check_ports;; 0) return;; esac
     done
@@ -322,7 +310,7 @@ menu_advanced_network() {
 # ================== 主菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V37.0 界面还原版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V38.0 终极融合版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (随机端口)"
