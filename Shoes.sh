@@ -16,6 +16,7 @@ SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
 SHOES_SERVICE="/etc/systemd/system/shoes.service"
 LINK_FILE="/root/proxy_links.txt"
 TMP_DIR="/tmp/proxydl"
+CURRENT_SCRIPT_PATH=$(readlink -f "$0") # 获取当前脚本路径
 
 # ================== 依赖检查 ==================
 install_dependencies() {
@@ -41,7 +42,42 @@ get_public_ip() {
     curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}'
 }
 
-# ================== 核心功能: 下载二进制 (通用) ==================
+# ================== 功能：创建快捷指令 ==================
+create_shortcut() {
+    # 将当前脚本复制到 /usr/local/bin 并重命名
+    cp -f "$CURRENT_SCRIPT_PATH" /usr/local/bin/shoes-menu
+    chmod +x /usr/local/bin/shoes-menu
+    
+    # 创建软链接到 /usr/bin/shoes
+    ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes
+    
+    echo -e "${GREEN}>>> 快捷指令已创建！${RESET}"
+    echo -e "以后只需在终端输入 ${YELLOW}shoes${RESET} 即可打开此菜单。"
+}
+
+# ================== 功能：开启 BBR 加速 ==================
+enable_bbr() {
+    echo -e "${CYAN}=== 正在开启 BBR 加速 ===${RESET}"
+    if grep -q "bbr" /etc/sysctl.conf; then
+        echo -e "${GREEN}BBR 似乎已经开启，跳过配置。${RESET}"
+    else
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p
+        echo -e "${GREEN}BBR 加速已开启！${RESET}"
+    fi
+    read -rp "按回车继续..." _
+}
+
+# ================== 功能：实时日志监控 ==================
+view_realtime_log() {
+    echo -e "${CYAN}=== 正在打开实时日志 (按 Ctrl+C 退出) ===${RESET}"
+    echo -e "${GRAY}请现在尝试用客户端连接，如果连通，下方会滚动日志...${RESET}"
+    sleep 2
+    journalctl -u shoes -f
+}
+
+# ================== 核心功能: 下载二进制 ==================
 download_shoes_core() {
     echo -e "${GREEN}>>> 正在获取最新 Shoes 版本信息...${RESET}"
     check_arch
@@ -62,9 +98,7 @@ download_shoes_core() {
     FIND_SHOES=$(find . -type f -name "shoes" | head -n 1)
     [[ -z "$FIND_SHOES" ]] && { echo -e "${RED}解压后未找到 shoes${RESET}"; return 1; }
     
-    # 停止服务以允许覆盖
     systemctl stop shoes >/dev/null 2>&1
-    
     cp "$FIND_SHOES" "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
     return 0
@@ -74,14 +108,12 @@ download_shoes_core() {
 install_shoes() {
     install_dependencies
     
-    # 调用下载核心
     download_shoes_core
     if [[ $? -ne 0 ]]; then return; fi
 
-    # 配置生成
     mkdir -p "${SHOES_CONF_DIR}"
     
-    # 随机 SNI 逻辑
+    # 随机 SNI
     SNI_LIST=("www.microsoft.com" "itunes.apple.com" "gateway.icloud.com" "www.amazon.com" "www.tesla.com" "dl.google.com" "www.yahoo.com")
     SNI=${SNI_LIST[$RANDOM % ${#SNI_LIST[@]}]}
     echo -e "${GREEN}>>> 随机伪装域名: ${YELLOW}${SNI}${RESET}"
@@ -102,7 +134,6 @@ install_shoes() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
 
-    # 写入配置
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -138,7 +169,6 @@ install_shoes() {
     udp_enabled: true
 EOF
 
-    # Systemd
     cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -156,6 +186,10 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now shoes
+    
+    # 自动创建快捷指令
+    create_shortcut
+    
     echo -e "${GREEN}Shoes 安装并配置完成！${RESET}"
     generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER"
 }
@@ -163,28 +197,11 @@ EOF
 # ================== 单独更新内核 ==================
 update_shoes_only() {
     echo -e "${CYAN}=== 正在更新 Shoes 内核 (保留配置) ===${RESET}"
-    
-    if [[ ! -f "${SHOES_CONF_FILE}" ]]; then
-        echo -e "${RED}未检测到配置文件，请先执行安装！${RESET}"
-        return
-    fi
-    
-    # 下载并覆盖二进制
+    if [[ ! -f "${SHOES_CONF_FILE}" ]]; then echo -e "${RED}未安装！${RESET}"; return; fi
     download_shoes_core
-    if [[ $? -ne 0 ]]; then 
-        echo -e "${RED}更新失败，未修改任何文件。${RESET}"
-        return
-    fi
-    
-    echo -e "${GREEN}正在重启服务...${RESET}"
-    systemctl restart shoes
-    
-    if systemctl is-active --quiet shoes; then
-        echo -e "${GREEN}更新成功！当前版本已是最新。${RESET}"
-        echo -e "配置未变更，您的节点链接依然有效。"
-    else
-        echo -e "${RED}服务启动失败，请检查日志。${RESET}"
-        journalctl -u shoes -n 10 --no-pager
+    if [[ $? -eq 0 ]]; then 
+        systemctl restart shoes
+        echo -e "${GREEN}更新成功！节点信息未变更。${RESET}"
     fi
 }
 
@@ -198,7 +215,6 @@ generate_links_content() {
     local ss_port=$6
     local ss_pass=$7
     local ss_cipher=$8
-    
     HOST_IP=$(get_public_ip)
     
     VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_${sni}"
@@ -212,26 +228,22 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== IPv6 切换 (精简版) ==================
+# ================== IPv6 切换 ==================
 switch_system_ipv6() {
-    # (此处省略部分代码以节省篇幅，功能与之前一致，保留)
     clear
     echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
     local ip_with_prefix=()
     mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
-
-    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then
-        echo -e "${RED}未检测到可用的公网 IPv6 地址。${RESET}"; read -p "按回车返回..." _; return
-    fi
+    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}无 IPv6${RESET}"; read -p "..." _; return; fi
     
-    echo -e "请选择要设为默认出口的 IP (仅列出，不测试延迟以加快速度)：\n"
+    echo -e "可用 IP 列表："
     local i=1
     for item in "${ip_with_prefix[@]}"; do
         echo -e " ${GREEN}[$i]${RESET} ${YELLOW}${item}${RESET}"
         ((i++))
     done
-    echo -e " ${GREEN}[0]${RESET} 取消返回"
-    read -rp "请输入序号: " choice
+    echo -e " ${GREEN}[0]${RESET} 取消"
+    read -rp "选择: " choice
     [[ "$choice" == "0" || -z "$choice" ]] && return
     
     local target_item="${ip_with_prefix[$((choice-1))]}"
@@ -245,53 +257,58 @@ switch_system_ipv6() {
     done
     ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
     
-    echo -e "${GREEN}切换完成！${RESET}"
+    echo -e "${GREEN}切换成功！${RESET}"
     read -rp "按回车继续..." _
 }
 
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 一键管理脚本 (V7.0 内核更新版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全能管理脚本 (V8.0) ===${RESET}"
+    echo -e "${GRAY}提示：任意位置输入 'shoes' 即可再次打开${RESET}"
     
     if systemctl is-active --quiet shoes; then
-        echo -e "运行状态: ${GREEN}运行中${RESET}"
+        echo -e "状态: ${GREEN}运行中${RESET}"
     else
-        echo -e "运行状态: ${RED}未运行${RESET}"
+        echo -e "状态: ${RED}未运行${RESET}"
     fi
     echo "------------------------"
-    echo "1. 安装 / 重置 Shoes (会生成新配置!)"
+    echo "1. 安装 / 重置 Shoes"
     echo "2. 停止服务"
     echo "3. 重启服务"
-    echo "4. 查看当前链接"
+    echo "4. 查看节点链接"
     echo "5. 卸载服务"
     echo "------------------------"
     echo -e "${CYAN}6. 高级网络设置 (IPv6 出口管理)${RESET}"
     echo -e "${YELLOW}7. 更新 Shoes 内核 (保留配置)${RESET}"
+    echo -e "${BLUE}8. 开启 BBR 加速 (推荐)${RESET}"
+    echo -e "${BLUE}9. 查看实时运行日志 (排错用)${RESET}"
     echo "------------------------"
     echo "0. 退出"
     read -p "请输入选项: " choice
 }
 
 # ================== 主逻辑 ==================
-check_arch
+# 首次运行时自动建立快捷指令
+if [[ ! -f /usr/bin/shoes ]]; then
+    cp -f "$0" /usr/local/bin/shoes-menu
+    chmod +x /usr/local/bin/shoes-menu
+    ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes
+fi
 
+check_arch
 while true; do
     show_menu
     case "$choice" in
         1) install_shoes ;;
         2) systemctl stop shoes; echo "已停止" ;;
         3) systemctl restart shoes; echo "已重启" ;;
-        4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无链接记录${RESET}"; fi ;;
-        5)
-            systemctl stop shoes
-            systemctl disable shoes
-            rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}"
-            systemctl daemon-reload
-            echo -e "${GREEN}卸载完成${RESET}"
-            ;;
+        4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无记录${RESET}"; fi ;;
+        5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/bin/shoes"; systemctl daemon-reload; echo "卸载完成";;
         6) switch_system_ipv6 ;;
         7) update_shoes_only ;;
+        8) enable_bbr ;;
+        9) view_realtime_log ;;
         0) exit 0 ;;
         *) echo "无效选项" ;;
     esac
