@@ -2,7 +2,7 @@
 
 # ================== 颜色代码 ==================
 RED='\033[0;31m'
-GREEN='\033[0;32m'
+GREEN='\033[1;32m' # 亮绿色
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
@@ -61,7 +61,7 @@ create_shortcut() {
             chmod +x "$MENU_BIN"
             echo -e "${GREEN}>>> 快捷指令已从 GitHub 恢复。${RESET}"
         else
-            echo -e "${RED}⚠️  无法创建快捷指令 'sho' (网络或文件问题)。${RESET}"
+            echo -e "${RED}⚠️  无法创建快捷指令 'sho'。${RESET}"
         fi
     fi
     if [[ -f "/usr/bin/shoes" ]]; then rm -f "/usr/bin/shoes"; fi
@@ -101,114 +101,94 @@ download_shoes_core() {
     return 0
 }
 
+# ================== 辅助函数：询问端口 ==================
+ask_port() {
+    local prompt=$1
+    local default_port=$2
+    local port_var=""
+    while true; do
+        read -rp "$prompt [默认随机: $default_port]: " port_var
+        if [[ -z "$port_var" ]]; then echo "$default_port"; return; fi
+        if [[ "$port_var" =~ ^[0-9]+$ ]] && [ "$port_var" -ge 1 ] && [ "$port_var" -le 65535 ]; then echo "$port_var"; return; else echo -e "${RED}无效端口${RESET}" >&2; fi
+    done
+}
+
 # ================== 安装/重置 Shoes ==================
 install_shoes() {
+    local mode=$1
     install_dependencies
     download_shoes_core
     if [[ $? -ne 0 ]]; then return; fi
 
     mkdir -p "${SHOES_CONF_DIR}"
     
+    local rnd_vless=$(shuf -i 20001-30000 -n 1)
+    local rnd_any=$(shuf -i 30001-35000 -n 1)
+    local rnd_ss=$(shuf -i 35001-40000 -n 1)
+    local rnd_ss22=$(shuf -i 40001-50000 -n 1)
+
+    VLESS_PORT=$rnd_vless; ANYTLS_PORT=$rnd_any; SS_PORT=$rnd_ss; SS22_PORT=$rnd_ss22
+
+    if [[ "$mode" == "custom" ]]; then
+        echo -e "\n${CYAN}=== NAT/自定义端口模式 ===${RESET}"
+        VLESS_PORT=$(ask_port "请输入 VLESS Reality 端口" $rnd_vless)
+        ANYTLS_PORT=$(ask_port "请输入 AnyTLS (HTTPS) 端口" $rnd_any)
+        SS_PORT=$(ask_port "请输入 SS-Legacy 端口" $rnd_ss)
+        SS22_PORT=$(ask_port "请输入 SS-2022 端口" $rnd_ss22)
+    fi
+
     # === 1. Reality ===
     SNI_LIST=("www.microsoft.com" "itunes.apple.com" "gateway.icloud.com" "www.amazon.com" "dl.google.com")
     SNI=${SNI_LIST[$RANDOM % ${#SNI_LIST[@]}]}
     SHID=$(openssl rand -hex 8)
-    VLESS_PORT=$(shuf -i 20001-30000 -n 1)
     UUID=$(cat /proc/sys/kernel/random/uuid)
     KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
-    open_port "$VLESS_PORT" "tcp"
-    open_port "$VLESS_PORT" "udp"
+    open_port "$VLESS_PORT" "tcp"; open_port "$VLESS_PORT" "udp"
 
     # === 2. AnyTLS ===
-    ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
-    ANYTLS_USER="anytls"
-    ANYTLS_PASS=$(openssl rand -hex 8)
-    ANYTLS_SNI="www.bing.com"
+    ANYTLS_USER="anytls"; ANYTLS_PASS=$(openssl rand -hex 8); ANYTLS_SNI="www.bing.com"
     open_port "$ANYTLS_PORT" "tcp"
 
-    # === 3. Shadowsocks (Legacy) ===
-    SS_PORT=$(shuf -i 35001-40000 -n 1)
-    SS_CIPHER="aes-256-gcm"
-    SS_PASSWORD=$(openssl rand -base64 16)
-    open_port "$SS_PORT" "tcp"
-    open_port "$SS_PORT" "udp"
+    # === 3. Shadowsocks ===
+    SS_CIPHER="aes-256-gcm"; SS_PASSWORD=$(openssl rand -base64 16)
+    open_port "$SS_PORT" "tcp"; open_port "$SS_PORT" "udp"
 
     # === 4. SS-2022 ===
-    SS22_PORT=$(shuf -i 45001-55000 -n 1)
-    SS22_CIPHER="2022-blake3-aes-256-gcm"
-    SS22_PASSWORD=$(openssl rand -base64 32)
-    open_port "$SS22_PORT" "tcp"
-    open_port "$SS22_PORT" "udp"
+    SS22_CIPHER="2022-blake3-aes-256-gcm"; SS22_PASSWORD=$(openssl rand -base64 32)
+    open_port "$SS22_PORT" "tcp"; open_port "$SS22_PORT" "udp"
 
-    # 证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}"
 
-    # 写入配置
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
-  protocol:
-    type: tls
-    reality_targets:
-      "${SNI}":
-        private_key: "${PRIVATE_KEY}"
-        short_ids: ["${SHID}"]
-        dest: "${SNI}:443"
-        vision: true
-        protocol:
-          type: vless
-          user_id: "${UUID}"
-          udp_enabled: true
+  protocol: { type: tls, reality_targets: { "${SNI}": { private_key: "${PRIVATE_KEY}", short_ids: ["${SHID}"], dest: "${SNI}:443", vision: true, protocol: { type: vless, user_id: "${UUID}", udp_enabled: true } } } }
 - address: "0.0.0.0:${ANYTLS_PORT}"
-  protocol:
-    type: tls
-    tls_targets:
-      "${ANYTLS_SNI}":
-        cert: "/etc/shoes/cert.pem"
-        key: "/etc/shoes/key.pem"
-        protocol:
-          type: anytls
-          users:
-            - name: "${ANYTLS_USER}"
-              password: "${ANYTLS_PASS}"
-          udp_enabled: true
+  protocol: { type: tls, tls_targets: { "${ANYTLS_SNI}": { cert: "/etc/shoes/cert.pem", key: "/etc/shoes/key.pem", protocol: { type: anytls, users: [{ name: "${ANYTLS_USER}", password: "${ANYTLS_PASS}" }], udp_enabled: true } } } }
 - address: "0.0.0.0:${SS_PORT}"
-  protocol:
-    type: shadowsocks
-    cipher: "${SS_CIPHER}"
-    password: "${SS_PASSWORD}"
-    udp_enabled: true
+  protocol: { type: shadowsocks, cipher: "${SS_CIPHER}", password: "${SS_PASSWORD}", udp_enabled: true }
 - address: "0.0.0.0:${SS22_PORT}"
-  protocol:
-    type: shadowsocks
-    cipher: "${SS22_CIPHER}"
-    password: "${SS22_PASSWORD}"
-    udp_enabled: true
+  protocol: { type: shadowsocks, cipher: "${SS22_CIPHER}", password: "${SS22_PASSWORD}", udp_enabled: true }
 EOF
 
     cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
 After=network.target
-
 [Service]
 Type=simple
 User=root
 ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
 Restart=on-failure
 LimitNOFILE=65535
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now shoes
-    create_shortcut
-    echo -e "${GREEN}Shoes (4协议安全版) 安装完成！${RESET}"
-    
+    systemctl daemon-reload; systemctl enable --now shoes; create_shortcut
+    echo -e "${GREEN}Shoes 安装完成！${RESET}"
     generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$ANYTLS_SNI" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
 }
 
@@ -239,124 +219,80 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 子菜单: IPv6 切换 ==================
+# ================== 网络设置子菜单 ==================
 sub_switch_ipv6_exit() {
-    clear
-    echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
-    echo -e "${GREEN}➜ ${RESET}正在扫描网卡上的公网 IPv6 地址..."
-    echo -e "${GREEN}➜ ${RESET}正在进行 地区解析 与 延迟测试 (Cloudflare)..."
-    echo -e "${GRAY}(如果 IP 较多，测试可能需要几秒钟，请耐心等待)${RESET}"
-    echo ""
+    clear; echo -e "${CYAN}=== IPv6 出口切换 ===${RESET}"; echo -e "${GREEN}➜ ${RESET}扫描中..."
     local ip_with_prefix=(); mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
-    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}未检测到可用的公网 IPv6 地址。${RESET}"; read -rp "按回车返回..." _; return; fi
+    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}无 IPv6${RESET}"; read -rp "..." _; return; fi
     local current_exit_ip=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oP 'src \K\S+')
-    echo -e "${GREEN}请选择要设为默认出口的 IP:${RESET}\n"
-    local i=1; local ping_cmd="ping -6"; command -v ping >/dev/null 2>&1 || ping_cmd="ping6"
+    echo -e "${GREEN}请选择默认出口:${RESET}\n"; local i=1
     for item in "${ip_with_prefix[@]}"; do
         local addr=${item%/*}; local status_mark=""
-        if [[ "$addr" == "$current_exit_ip" ]]; then status_mark="${GREEN}✔${RESET} ${YELLOW}(当前默认)${RESET}";
-        elif ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then status_mark="${GRAY}(备用)${RESET}";
-        else status_mark="${GRAY}(可选)${RESET}"; fi
-        local loc_str=""; if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then local api_res=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city" 2>/dev/null); if [[ -n "$api_res" ]]; then local country=$(echo "$api_res" | jq -r '.country // empty'); local city=$(echo "$api_res" | jq -r '.city // empty'); [[ -n "$country" ]] && loc_str="${BLUE}[${country} ${city}]${RESET}" || loc_str="${GRAY}[未知]${RESET}"; else loc_str="${GRAY}[超时]${RESET}"; fi; fi
-        local lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
-        local lat_str=""; if [[ -n "$lat_val" ]]; then local lat_num=${lat_val%.*}; if [[ "$lat_num" -lt 100 ]]; then lat_str="${GREEN}[${lat_val}ms]${RESET}"; elif [[ "$lat_num" -lt 200 ]]; then lat_str="${YELLOW}[${lat_val}ms]${RESET}"; else lat_str="${RED}[${lat_val}ms]${RESET}"; fi; else lat_str="${RED}[超时]${RESET}"; fi
-        echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"; ((i++))
+        if [[ "$addr" == "$current_exit_ip" ]]; then status_mark="${GREEN}✔${RESET} ${YELLOW}(当前默认)${RESET}"; else status_mark="${GRAY}(可选)${RESET}"; fi
+        local loc_str=""; if command -v curl >/dev/null; then local api=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city"); if [[ -n "$api" ]]; then local c=$(echo "$api"|jq -r '.country//empty'); local t=$(echo "$api"|jq -r '.city//empty'); [[ -n "$c" ]] && loc_str="${BLUE}[${c} ${t}]${RESET}"; fi; fi
+        echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${status_mark}"; ((i++))
     done
-    echo -e " ${GREEN}[0]${RESET} 取消返回"
-    echo ""; read -rp "请输入序号 [0-$((i-1))]: " choice
-    [[ "$choice" == "0" || -z "$choice" ]] && return
-    local target_item="${ip_with_prefix[$((choice-1))]}"
-    local target_ip="${target_item%/*}"; [[ -z "$target_ip" ]] && return
-    echo -e "\n正在切换出口 IP 至: $target_ip ..."
-    local gateway=$(ip -6 route show default | awk '/via/ {print $3}' | head -n1)
-    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1); [[ -z "$dev_name" ]] && dev_name="eth0"
-    for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1; done
-    ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
-    if [[ -n "$gateway" ]]; then ip -6 route replace default via "$gateway" dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1; else ip -6 route replace default dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1; fi
-    echo -e "${GREEN}切换成功！${RESET}"; read -rp "按回车继续..." _
+    echo -e " ${GREEN}[0]${RESET} 返回"; read -rp "选择: " choice; [[ "$choice" == "0" || -z "$choice" ]] && return
+    local target=${ip_with_prefix[$((choice-1))]}
+    local dev=$(ip -6 route show default|awk '/dev/{print $5}'|head -n1); [[ -z "$dev" ]] && dev="eth0"
+    for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev" preferred_lft 0 >/dev/null 2>&1; done
+    ip addr change "$target" dev "$dev" preferred_lft forever >/dev/null 2>&1
+    echo -e "${GREEN}切换成功${RESET}"; read -rp "..." _
 }
 
-# ================== 子菜单: 优先级切换 ==================
 sub_set_preference() {
-    clear
-    echo -e "${CYAN}=== 系统网络优先级设置 (IPv4 vs IPv6) ===${RESET}"
-    local current_pref=""
-    if grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null; then
-        current_pref="${GREEN}IPv4 优先${RESET}"
-    else
-        current_pref="${BLUE}IPv6 优先 (默认)${RESET}"
-    fi
-    echo -e "当前状态: ${current_pref}"
-    echo -e "说明: 修改此项可以解决部分网站解析慢或连接失败的问题。"
-    echo ""
-    echo -e "${GREEN}[1]${RESET} 设置为 IPv4 优先 (推荐,兼容性好)"
-    echo -e "${GREEN}[2]${RESET} 设置为 IPv6 优先 (系统默认)"
-    echo -e "${GREEN}[0]${RESET} 返回"
-    echo ""
-    read -rp "请选择: " sub_choice
-    case "$sub_choice" in
-        1)
-            if [[ ! -f /etc/gai.conf ]]; then echo "precedence ::ffff:0:0/96 100" > /etc/gai.conf; else sed -i '/^precedence ::ffff:0:0\/96 100/d' /etc/gai.conf; echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf; fi
-            echo -e "${GREEN}已设置为 IPv4 优先！${RESET}"
-            ;;
-        2)
-            if [[ -f /etc/gai.conf ]]; then sed -i '/^precedence ::ffff:0:0\/96 100/d' /etc/gai.conf; fi
-            echo -e "${GREEN}已恢复为 IPv6 优先！${RESET}"
-            ;;
-        0) return ;;
-        *) echo "无效选项" ;;
-    esac
-    read -rp "按回车继续..." _
+    clear; echo -e "${CYAN}=== IPv4/v6 优先级 ===${RESET}"
+    grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null && echo -e "当前: ${GREEN}IPv4 优先${RESET}" || echo -e "当前: ${BLUE}IPv6 优先${RESET}"
+    echo -e "\n${GREEN}[1]${RESET} 设为 IPv4 优先\n${GREEN}[2]${RESET} 设为 IPv6 优先\n${GREEN}[0]${RESET} 返回\n"
+    read -rp "选择: " c
+    case "$c" in 1) echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf ;; 2) sed -i '/^precedence ::ffff:0:0\/96 100/d' /etc/gai.conf ;; esac
+    echo -e "${GREEN}设置完成${RESET}"; read -rp "..." _
 }
 
-# ================== 子菜单: 端口查询 (NEW) ==================
 sub_check_ports() {
     clear
-    echo -e "${CYAN}=== 系统端口监听查询 (ss -tulpn) ===${RESET}"
-    echo -e "${GRAY}下表显示了当前正在监听的端口。${RESET}"
-    echo -e "重点关注 Process 为 ${YELLOW}shoes-core${RESET} 的行，那些就是你的代理端口。"
-    echo -e "${GRAY}------------------------------------------------------------${RESET}"
-    echo -e "${YELLOW}Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name${RESET}"
+    echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
+    echo -e "${GRAY}Local/Foreign 地址部分保持紫色/灰色，PID Name 部分高亮绿色${RESET}"
+    echo -e "${PURPLE}Proto Recv-Q Send-Q Local Address           Foreign Address         State       ${RESET}${YELLOW}PID/Program name${RESET}"
+    echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
     
-    # 执行命令并高亮 shoes-core
-    # 使用 grep -E 过滤 tcp/udp，然后用 sed 给 shoes-core 上色
-    ss -tulpn | grep -E "^(udp|tcp)" | sed --unbuffered "s/shoes-core/${GREEN}shoes-core${RESET}/g"
+    # 关键修改：使用 bash 字符串替换，精准高亮 shoes-core，不影响前面
+    ss -tulpn | grep -E "^(udp|tcp)" | while read -r line; do
+        # 统一把前面的部分设为淡紫色/灰色
+        local colored_line="${PURPLE}${line}${RESET}"
+        
+        # 如果包含 shoes-core，把这个关键词换成亮绿色，并重置回紫色或结束颜色
+        if [[ "$line" == *"shoes-core"* ]]; then
+            # 替换 shoes-core 为 绿色shoes-core，注意 sed 这里只替换匹配到的部分
+            # 使用 echo 输出，将 shoes-core 替换为带颜色的版本
+            echo -e "${PURPLE}${line//shoes-core/${GREEN}shoes-core${PURPLE}}${RESET}"
+        else
+            echo -e "${PURPLE}${line}${RESET}"
+        fi
+    done
     
-    echo -e "${GRAY}------------------------------------------------------------${RESET}"
-    echo -e "如果上面没有看到 ${GREEN}shoes-core${RESET}，说明服务未启动。"
+    echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
+    echo -e "未见 ${GREEN}shoes-core${RESET} 则服务未启动"
     echo ""
     read -rp "按回车返回..." _
 }
 
-# ================== 主菜单 ==================
 menu_advanced_network() {
     while true; do
-        clear
-        echo -e "${CYAN}=== 高级网络设置 ===${RESET}"
-        echo "------------------------"
-        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP (多 IP 管理)"
-        echo -e "${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级"
-        echo -e "${GREEN}[3]${RESET} 查询当前监听端口 (Port Check)"
-        echo "------------------------"
-        echo -e "${GREEN}[0]${RESET} 返回主菜单"
-        echo ""
-        read -rp "请输入选项: " adv_choice
-        case "$adv_choice" in
-            1) sub_switch_ipv6_exit ;;
-            2) sub_set_preference ;;
-            3) sub_check_ports ;;
-            0) return ;;
-            *) echo "无效选项"; sleep 1 ;;
-        esac
+        clear; echo -e "${CYAN}=== 高级网络设置 ===${RESET}"
+        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听 (美化版)\n${GREEN}[0]${RESET} 返回"
+        read -rp "选择: " c
+        case "$c" in 1) sub_switch_ipv6_exit;; 2) sub_set_preference;; 3) sub_check_ports;; 0) return;; esac
     done
 }
 
+# ================== 主菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V30.0 端口侦探版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V32.0 端口显示美化版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
-    echo "1. 安装 / 重置 Shoes (全部重置)"
+    echo "1. 安装 / 重置 Shoes (随机端口)"
     echo "2. 停止服务"
     echo "3. 重启服务"
     echo "4. 查看所有链接"
@@ -367,6 +303,7 @@ show_menu() {
     echo -e "${BLUE}8. 更新 Shoes 内核 (保留配置文件)${RESET}"
     echo "------------------------"
     echo -e "${GRAY}9. 查看实时日志${RESET}"
+    echo -e "${RED}10. 自定义端口重装 (NAT/高级专用)${RESET}"
     echo "0. 退出"
     read -p "选项: " choice
 }
@@ -377,7 +314,7 @@ check_arch
 while true; do
     show_menu
     case "$choice" in
-        1) install_shoes ;;
+        1) install_shoes "random" ;;
         2) systemctl stop shoes; echo "停用";; 
         3) systemctl restart shoes; echo "重启";;
         4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
@@ -386,6 +323,7 @@ while true; do
         7) enable_bbr ;;       
         8) update_shoes_only ;; 
         9) view_realtime_log ;;
+        10) install_shoes "custom" ;;
         0) exit 0 ;;
         *) echo "无效" ;;
     esac
