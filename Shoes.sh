@@ -80,17 +80,16 @@ install_shoes() {
     # --- AnyTLS 参数 ---
     ANYTLS_PORT=$(shuf -i 30001-40000 -n 1)
     
-    # --- Shadowsocks 参数 (新增) ---
+    # --- Shadowsocks 参数 (修正字段名) ---
     SS_PORT=$(shuf -i 40001-50000 -n 1)
-    SS_METHOD="aes-256-gcm"
+    SS_CIPHER="aes-256-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
 
     # 生成自签名证书 (AnyTLS用)
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
 
-    # 3. 写入配置文件 (集成 SS)
-    # ⚠️ 注意: 这里假设 Shoes 的 SS 配置格式是标准的 protocol: type: shadowsocks
+    # 3. 写入配置文件 (已修正 method -> cipher)
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -121,7 +120,7 @@ install_shoes() {
 - address: "0.0.0.0:${SS_PORT}"
   protocol:
     type: shadowsocks
-    method: "${SS_METHOD}"
+    cipher: "${SS_CIPHER}"
     password: "${SS_PASSWORD}"
     udp_enabled: true
 EOF
@@ -147,7 +146,7 @@ EOF
     echo -e "${GREEN}Shoes (含SS) 安装完成！${RESET}"
     
     # 5. 生成并保存链接
-    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_METHOD"
+    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER"
 }
 
 # ================== 生成链接函数 ==================
@@ -160,15 +159,15 @@ generate_links_content() {
     local sid=$5
     local ss_port=$6
     local ss_pass=$7
-    local ss_method=$8
+    local ss_cipher=$8
     
     HOST_IP=$(get_public_ip)
     
     # VLESS Link
     VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_Reality"
 
-    # SS Link (Base64编码 method:password)
-    SS_BASE=$(echo -n "${ss_method}:${ss_pass}" | base64 -w 0)
+    # SS Link (Base64编码 cipher:password)
+    SS_BASE=$(echo -n "${ss_cipher}:${ss_pass}" | base64 -w 0)
     SS_LINK="ss://${SS_BASE}@${HOST_IP}:${ss_port}#Shoes_SS"
 
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
@@ -179,14 +178,14 @@ generate_links_content() {
     echo -e "\n--- Shadowsocks ---" | tee -a "${LINK_FILE}"
     echo -e "端口: ${ss_port}" | tee -a "${LINK_FILE}"
     echo -e "密码: ${ss_pass}" | tee -a "${LINK_FILE}"
-    echo -e "加密: ${ss_method}" | tee -a "${LINK_FILE}"
+    echo -e "加密: ${ss_cipher}" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 一键管理脚本 (VLESS + SS) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 一键管理脚本 (V4.0 修复版) ===${RESET}"
     
     if systemctl is-active --quiet shoes; then
         echo -e "运行状态: ${GREEN}运行中${RESET}"
