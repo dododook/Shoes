@@ -24,7 +24,8 @@ LINK_FILE="/root/proxy_links.txt"
 TMP_DIR="/tmp/proxydl"
 
 # 缓存 IP
-CURRENT_IP=""
+CURRENT_IPV4=""
+CURRENT_IPV6=""
 
 # ================== 依赖检查 ==================
 install_dependencies() {
@@ -59,13 +60,15 @@ check_arch() {
     esac
 }
 
-# ================== 获取 IP ==================
-get_public_ip() {
-    local ip=$(curl -s -4 --max-time 2 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-    if [[ -z "$ip" ]]; then
-        ip=$(curl -s -4 --max-time 2 http://ip-api.com/json | jq -r .query)
-    fi
-    echo "$ip"
+# ================== 获取 IP (双栈版) ==================
+get_ipv4() {
+    local ip=$(curl -s -4 --max-time 1 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
+    if [[ -z "$ip" ]]; then echo "检测中..."; else echo "$ip"; fi
+}
+
+get_ipv6() {
+    local ip=$(curl -s -6 --max-time 1 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
+    if [[ -z "$ip" ]]; then echo "${GRAY}未检测到 IPv6${RESET}"; else echo "$ip"; fi
 }
 
 # ================== 快捷指令 ==================
@@ -153,6 +156,7 @@ install_shoes() {
         SS22_PORT=$(ask_port "请输入 SS-2022 端口" $rnd_ss22)
     fi
 
+    # === 1. Reality ===
     SNI_LIST=("www.microsoft.com" "itunes.apple.com" "gateway.icloud.com" "www.amazon.com" "dl.google.com")
     SNI=${SNI_LIST[$RANDOM % ${#SNI_LIST[@]}]}
     SHID=$(openssl rand -hex 8)
@@ -162,12 +166,15 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     open_port "$VLESS_PORT" "tcp"; open_port "$VLESS_PORT" "udp"
 
+    # === 2. AnyTLS ===
     ANYTLS_USER="anytls"; ANYTLS_PASS=$(openssl rand -hex 8); ANYTLS_SNI="www.bing.com"
     open_port "$ANYTLS_PORT" "tcp"
 
+    # === 3. Shadowsocks ===
     SS_CIPHER="aes-256-gcm"; SS_PASSWORD=$(openssl rand -base64 16)
     open_port "$SS_PORT" "tcp"; open_port "$SS_PORT" "udp"
 
+    # === 4. SS-2022 ===
     SS22_CIPHER="2022-blake3-aes-256-gcm"; SS22_PASSWORD=$(openssl rand -base64 32)
     open_port "$SS22_PORT" "tcp"; open_port "$SS22_PORT" "udp"
 
@@ -210,7 +217,7 @@ generate_links_content() {
     local ss_port=$6; local ss_pass=$7; local ss_cipher=$8
     local any_port=$9; local any_user=${10}; local any_pass=${11}; local any_sni=${12}
     local ss22_port=${13}; local ss22_pass=${14}; local ss22_cipher=${15}
-    local ip=$(get_public_ip)
+    local ip=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
     
     VLESS_LINK="vless://${uuid}@${ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_${sni}"
     SS_BASE=$(echo -n "${ss_cipher}:${ss_pass}" | base64 -w 0)
@@ -276,17 +283,15 @@ sub_set_preference() {
     echo -e "${GREEN}设置完成${RESET}"; read -rp "..." _
 }
 
-# ================== 端口查询 (紫色主题+绿色高亮) ==================
+# ================== 端口查询 (V32 紫色背景版) ==================
 sub_check_ports() {
     clear
-    echo -e "${CYAN}=== 系统端口监听查询 (ss -tulpn) ===${RESET}"
-    echo -e "下表显示了当前正在监听的端口。"
-    echo -e "重点关注 Process 为 ${GREEN}shoes-core${RESET} 的行，那些就是你的代理端口。"
-    # 表头 黄色
+    echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
+    echo -e "${GRAY}重点关注 Process 为 ${GREEN}shoes-core${RESET}${GRAY} 的行，那些就是你的代理端口。${RESET}"
     echo -e "${YELLOW}Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name${RESET}"
+    echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
     
-    # 核心逻辑：全部紫色，只替换 shoes-core 为 绿色+shoes-core+紫色
-    ss -tulpn | grep -E "^(udp|tcp)" | while IFS= read -r line; do
+    ss -tulpn | grep -E "^(udp|tcp)" | while read -r line; do
         if [[ "$line" == *"shoes-core"* ]]; then
             # 替换字符串中的 shoes-core 为带颜色的版本
             echo -e "${PURPLE}${line//shoes-core/${GREEN}shoes-core${PURPLE}}${RESET}"
@@ -295,7 +300,8 @@ sub_check_ports() {
         fi
     done
     
-    echo -e "如果上面没有看到 ${GREEN}shoes-core${RESET}，说明服务未启动。"
+    echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
+    echo -e "未见 ${GREEN}shoes-core${RESET} 则服务未启动"
     echo ""
     read -rp "按回车返回..." _
 }
@@ -303,7 +309,7 @@ sub_check_ports() {
 menu_advanced_network() {
     while true; do
         clear; echo -e "${CYAN}=== 高级网络设置 ===${RESET}"
-        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听 (紫色版)\n${GREEN}[0]${RESET} 返回"
+        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听 (美化版)\n${GREEN}[0]${RESET} 返回"
         read -rp "选择: " c
         case "$c" in 1) sub_switch_ipv6_exit;; 2) sub_set_preference;; 3) sub_check_ports;; 0) return;; esac
     done
@@ -314,20 +320,26 @@ update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_c
 enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
 view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoes -f; }
 
-# ================== 主菜单 (带监控) ==================
+# ================== 主菜单 (美化版) ==================
 show_menu() {
     clear
     local cpu_usage=$(awk '{print $1}' /proc/loadavg)
     local mem_usage=$(free -m | awk 'NR==2{printf "%sMB/%sMB (%.0f%%)", $3, $2, $3*100/$2 }')
-    if [[ -z "$CURRENT_IP" ]]; then CURRENT_IP=$(get_public_ip); fi
     
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V40.0 终极颜值版) ===${RESET}"
+    # 获取IP (有缓存则用缓存)
+    if [[ -z "$CURRENT_IPV4" ]]; then CURRENT_IPV4=$(get_ipv4); fi
+    if [[ -z "$CURRENT_IPV6" ]]; then CURRENT_IPV6=$(get_ipv6); fi
     
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V41.0 完美界面版) ===${RESET}"
+    echo ""
     echo -e "${CYAN}┌──[ 系统监控 ]────────────────────────────────────────────────┐${RESET}"
-    echo -e "${CYAN}│${RESET} CPU: ${GREEN}${cpu_usage}${RESET} | 内存: ${GREEN}${mem_usage}${RESET}"
-    echo -e "${CYAN}│${RESET} IP : ${GREEN}${CURRENT_IP:-获取中...}${RESET}"
+    echo -e "${CYAN}│                                                              │${RESET}"
+    echo -e "${CYAN}│   ${RESET}CPU负载: ${GREEN}${cpu_usage}${RESET}  |  内存使用: ${GREEN}${mem_usage}${RESET}"
+    echo -e "${CYAN}│   ${RESET}IPv4: ${GREEN}${CURRENT_IPV4}${RESET}"
+    echo -e "${CYAN}│   ${RESET}IPv6: ${GREEN}${CURRENT_IPV6}${RESET}"
+    echo -e "${CYAN}│                                                              │${RESET}"
     echo -e "${CYAN}└──────────────────────────────────────────────────────────────┘${RESET}"
-
+    echo ""
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (随机端口)"
@@ -349,7 +361,9 @@ show_menu() {
 check_and_install_deps
 create_shortcut
 check_arch
-CURRENT_IP=$(get_public_ip)
+# 预加载IP
+CURRENT_IPV4=$(get_ipv4)
+CURRENT_IPV6=$(get_ipv6)
 
 while true; do
     show_menu
