@@ -26,9 +26,9 @@ TMP_DIR="/tmp/proxydl"
 # ================== 依赖检查 ==================
 install_dependencies() {
     if command -v apt >/dev/null; then
-        apt update && apt install -y curl wget tar openssl jq iproute2 iptables
+        apt update && apt install -y curl wget tar openssl jq iproute2 iptables sed
     elif command -v yum >/dev/null; then
-        yum install -y curl wget tar openssl jq iproute iptables
+        yum install -y curl wget tar openssl jq iproute iptables sed
     fi
 }
 
@@ -114,21 +114,21 @@ install_shoes() {
     open_port "$VLESS_PORT" "tcp"
     open_port "$VLESS_PORT" "udp"
 
-    # === 2. AnyTLS (保留 SNI 修复) ===
+    # === 2. AnyTLS ===
     ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
     ANYTLS_USER="anytls"
-    ANYTLS_PASS=$(openssl rand -hex 8) # 随机密码更安全
+    ANYTLS_PASS=$(openssl rand -hex 8)
     ANYTLS_SNI="www.bing.com"
     open_port "$ANYTLS_PORT" "tcp"
 
-    # === 3. Shadowsocks (Legacy) ===
+    # === 3. Shadowsocks ===
     SS_PORT=$(shuf -i 35001-40000 -n 1)
     SS_CIPHER="aes-256-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
     open_port "$SS_PORT" "tcp"
     open_port "$SS_PORT" "udp"
 
-    # === 4. SS-2022 (保留 OpenSSL 修复) ===
+    # === 4. SS-2022 ===
     SS22_PORT=$(shuf -i 45001-55000 -n 1)
     SS22_CIPHER="2022-blake3-aes-256-gcm"
     SS22_PASSWORD=$(openssl rand -base64 32)
@@ -139,7 +139,7 @@ install_shoes() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}"
 
-    # 写入配置 (去除了 SOCKS5)
+    # 写入配置
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -201,7 +201,6 @@ EOF
     systemctl enable --now shoes
     create_shortcut
     echo -e "${GREEN}Shoes (4协议安全版) 安装完成！${RESET}"
-    
     generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$ANYTLS_SNI" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
 }
 
@@ -232,8 +231,8 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 高级 IPv6 切换 (1:1 UI复刻版) ==================
-switch_system_ipv6() {
+# ================== (子菜单) IPv6 切换逻辑 ==================
+sub_switch_ipv6_exit() {
     clear
     echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
     echo -e "${GREEN}➜ ${RESET}正在扫描网卡上的公网 IPv6 地址..."
@@ -269,15 +268,84 @@ switch_system_ipv6() {
     echo -e "${GREEN}切换成功！${RESET}"; read -rp "按回车继续..." _
 }
 
+# ================== (子菜单) 协议优先级切换 ==================
+sub_set_preference() {
+    clear
+    echo -e "${CYAN}=== 系统网络优先级设置 (IPv4 vs IPv6) ===${RESET}"
+    
+    # 检查当前状态
+    # 在 /etc/gai.conf 中，如果 precedence ::ffff:0:0/96 100 存在且未注释，则是 IPv4 优先
+    local current_pref=""
+    if grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null; then
+        current_pref="${GREEN}IPv4 优先${RESET}"
+    else
+        current_pref="${BLUE}IPv6 优先 (默认)${RESET}"
+    fi
+    
+    echo -e "当前状态: ${current_pref}"
+    echo -e "说明: 修改此项可以解决部分网站解析慢或连接失败的问题。"
+    echo ""
+    echo -e "${GREEN}[1]${RESET} 设置为 IPv4 优先 (推荐,兼容性好)"
+    echo -e "${GREEN}[2]${RESET} 设置为 IPv6 优先 (系统默认)"
+    echo -e "${GREEN}[0]${RESET} 返回"
+    echo ""
+    read -rp "请选择: " sub_choice
+    
+    case "$sub_choice" in
+        1)
+            # 如果文件不存在，创建
+            if [[ ! -f /etc/gai.conf ]]; then
+                echo "precedence ::ffff:0:0/96 100" > /etc/gai.conf
+            else
+                # 先删除旧的配置防止重复
+                sed -i '/^precedence ::ffff:0:0\/96 100/d' /etc/gai.conf
+                # 添加配置到末尾
+                echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf
+            fi
+            echo -e "${GREEN}已设置为 IPv4 优先！${RESET}"
+            ;;
+        2)
+            if [[ -f /etc/gai.conf ]]; then
+                sed -i '/^precedence ::ffff:0:0\/96 100/d' /etc/gai.conf
+            fi
+            echo -e "${GREEN}已恢复为 IPv6 优先！${RESET}"
+            ;;
+        0) return ;;
+        *) echo "无效选项" ;;
+    esac
+    read -rp "按回车继续..." _
+}
+
+# ================== (主) 高级网络菜单 ==================
+menu_advanced_network() {
+    while true; do
+        clear
+        echo -e "${CYAN}=== 高级网络设置 ===${RESET}"
+        echo "------------------------"
+        echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP (多 IP 管理)"
+        echo -e "${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级 (V4/V6 选择)"
+        echo "------------------------"
+        echo -e "${GREEN}[0]${RESET} 返回主菜单"
+        echo ""
+        read -rp "请输入选项: " adv_choice
+        case "$adv_choice" in
+            1) sub_switch_ipv6_exit ;;
+            2) sub_set_preference ;;
+            0) return ;;
+            *) echo "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
 # ================== 辅助功能 ==================
 update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core; if [[ $? -eq 0 ]]; then systemctl restart shoes; echo -e "${GREEN}更新成功${RESET}"; fi }
 enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
 view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoes -f; }
 
-# ================== 菜单 ==================
+# ================== 主菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V27.0 安全加固版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V28.0 网络工具箱版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
@@ -286,7 +354,7 @@ show_menu() {
     echo "4. 查看所有链接"
     echo "5. 卸载服务"
     echo "------------------------"
-    echo -e "${CYAN}6. 高级网络设置 (IPv6 出口管理)${RESET}"
+    echo -e "${CYAN}6. 高级网络设置 (IPv6管理 / 优先级)${RESET}"
     echo -e "${YELLOW}7. 开启 BBR 加速 (优化网络速度)${RESET}"
     echo -e "${BLUE}8. 更新 Shoes 内核 (保留配置文件)${RESET}"
     echo "------------------------"
@@ -306,7 +374,7 @@ while true; do
         3) systemctl restart shoes; echo "重启";;
         4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
         5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/sho" "/usr/bin/sho"; systemctl daemon-reload; echo "卸载完毕";;
-        6) switch_system_ipv6 ;;
+        6) menu_advanced_network ;;
         7) enable_bbr ;;       
         8) update_shoes_only ;; 
         9) view_realtime_log ;;
