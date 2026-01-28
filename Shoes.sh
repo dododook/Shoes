@@ -11,14 +11,12 @@ GRAY='\033[0;90m'
 RESET='\033[0m'
 
 # ================== 常量定义 ==================
-SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
 SHOES_BIN="/usr/local/bin/shoes"
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
 SHOES_SERVICE="/etc/systemd/system/shoes.service"
 LINK_FILE="/root/proxy_links.txt"
 TMP_DIR="/tmp/proxydl"
-CURRENT_SCRIPT_PATH=$(readlink -f "$0")
 
 # ================== 依赖检查 ==================
 install_dependencies() {
@@ -44,16 +42,21 @@ get_public_ip() {
     curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}'
 }
 
-# ================== 快捷指令 (修复版) ==================
+# ================== 快捷指令 (本地复制版) ==================
 create_shortcut() {
-    if [[ -f "$0" && ! -L "$0" ]]; then
-        cp -f "$0" /usr/local/bin/shoes-menu
+    # 获取当前脚本的绝对路径
+    CURRENT_FILE=$(readlink -f "$0")
+    
+    # 只有当脚本是作为一个文件存在时，才创建快捷方式
+    if [[ -f "$CURRENT_FILE" ]]; then
+        cp -f "$CURRENT_FILE" /usr/local/bin/shoes-menu
+        chmod +x /usr/local/bin/shoes-menu
+        ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes
+        echo -e "${GREEN}>>> 快捷指令 'shoes' 已修复！${RESET}"
     else
-        echo -e "${GREEN}>>> 检测到在线运行，正在下载脚本以创建快捷指令...${RESET}"
-        curl -sL "$SCRIPT_URL" -o /usr/local/bin/shoes-menu
+        echo -e "${RED}>>> 警告：未检测到脚本文件实体，跳过快捷指令创建。${RESET}"
+        echo -e "${YELLOW}>>> 请将代码保存为文件 (例如 shoes.sh) 并运行 bash shoes.sh 才能启用快捷键。${RESET}"
     fi
-    chmod +x /usr/local/bin/shoes-menu
-    ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes
 }
 
 # ================== 核心功能: 下载二进制 ==================
@@ -99,10 +102,10 @@ install_shoes() {
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
 
-    # 2. AnyTLS (现在使用 UUID 作为密码)
+    # 2. AnyTLS (使用 UUID)
     ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
     ANYTLS_USER="anytls"
-    ANYTLS_PASS=$(cat /proc/sys/kernel/random/uuid) # 生成 UUID
+    ANYTLS_PASS=$(cat /proc/sys/kernel/random/uuid) 
 
     # 3. Shadowsocks (Legacy)
     SS_PORT=$(shuf -i 35001-40000 -n 1)
@@ -211,9 +214,6 @@ generate_links_content() {
     SOCKS_LINK="socks5://${SOCKS_BASE}@${HOST_IP}:${socks_port}#Shoes_S5"
     SS22_BASE=$(echo -n "${ss22_cipher}:${ss22_pass}" | base64 -w 0)
     SS22_LINK="ss://${SS22_BASE}@${HOST_IP}:${ss22_port}#Shoes_2022"
-    
-    # AnyTLS Link (使用 UUID 格式)
-    # 格式: anytls://UUID@IP:PORT?security=tls&insecure=1&type=tcp#Remark
     ANYTLS_LINK="anytls://${any_pass}@${HOST_IP}:${any_port}?security=tls&insecure=1&type=tcp#Shoes_AnyTLS"
 
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
@@ -275,7 +275,7 @@ view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoe
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V18.0 AnyTLS修正版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V19.0 快捷键修复版) ===${RESET}"
     echo -e "${GRAY}输入 'shoes' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
@@ -293,8 +293,10 @@ show_menu() {
     read -p "选项: " choice
 }
 
-if [[ ! -f /usr/bin/shoes ]]; then cp -f "$0" /usr/local/bin/shoes-menu; chmod +x /usr/local/bin/shoes-menu; ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes; fi
+# 自动创建快捷方式并启动
+create_shortcut
 check_arch
+
 while true; do
     show_menu
     case "$choice" in
