@@ -80,8 +80,7 @@ install_shoes() {
 
     mkdir -p "${SHOES_CONF_DIR}"
     
-    # === 参数生成 ===
-    # 1. Reality
+    # 1. Reality (随机 SNI)
     SNI_LIST=("www.microsoft.com" "itunes.apple.com" "gateway.icloud.com" "www.amazon.com" "www.tesla.com" "dl.google.com" "www.yahoo.com")
     SNI=${SNI_LIST[$RANDOM % ${#SNI_LIST[@]}]}
     echo -e "${GREEN}>>> 随机伪装域名: ${YELLOW}${SNI}${RESET}"
@@ -89,31 +88,36 @@ install_shoes() {
     SHID=$(openssl rand -hex 8)
     VLESS_PORT=$(shuf -i 20001-30000 -n 1)
     UUID=$(cat /proc/sys/kernel/random/uuid)
-    
     KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
 
-    # 2. AnyTLS (HTTP/HTTPS Proxy)
+    # 2. AnyTLS
     ANYTLS_PORT=$(shuf -i 30001-35000 -n 1)
     ANYTLS_USER="any"
-    ANYTLS_PASS=$(openssl rand -base64 8) # 8位随机密码
+    ANYTLS_PASS=$(openssl rand -base64 8) 
 
-    # 3. Shadowsocks
+    # 3. Shadowsocks (传统 AEAD)
     SS_PORT=$(shuf -i 35001-40000 -n 1)
     SS_CIPHER="aes-256-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
 
-    # 4. SOCKS5 (新增)
-    SOCKS_PORT=$(shuf -i 40001-50000 -n 1)
+    # 4. SOCKS5
+    SOCKS_PORT=$(shuf -i 40001-45000 -n 1)
     SOCKS_USER="socks"
     SOCKS_PASS=$(openssl rand -base64 8)
 
-    # 生成自签名证书 (AnyTLS用)
+    # 5. Shadowsocks-2022 (新增!)
+    SS22_PORT=$(shuf -i 45001-55000 -n 1)
+    SS22_CIPHER="2022-blake3-aes-256-gcm"
+    # 调用 shoes 内核生成专用密钥 (awk取最后一段以防有前缀)
+    SS22_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password "${SS22_CIPHER}" | awk '{print $NF}')
+
+    # 生成自签名证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com"
 
-    # === 写入配置 ===
+    # === 写入配置 (5个入站) ===
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -154,9 +158,15 @@ install_shoes() {
       - username: "${SOCKS_USER}"
         password: "${SOCKS_PASS}"
     udp_enabled: true
+- address: "0.0.0.0:${SS22_PORT}"
+  protocol:
+    type: shadowsocks
+    cipher: "${SS22_CIPHER}"
+    password: "${SS22_PASSWORD}"
+    udp_enabled: true
 EOF
 
-    # === Systemd ===
+    # Systemd
     cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -176,9 +186,8 @@ EOF
     systemctl daemon-reload
     systemctl enable --now shoes
     create_shortcut
-    
-    echo -e "${GREEN}Shoes (4协议) 安装完成！${RESET}"
-    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS"
+    echo -e "${GREEN}Shoes (5协议) 安装完成！${RESET}"
+    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
 }
 
 # ================== 生成链接 ==================
@@ -187,77 +196,81 @@ generate_links_content() {
     local ss_port=$6; local ss_pass=$7; local ss_cipher=$8
     local any_port=$9; local any_user=${10}; local any_pass=${11}
     local socks_port=${12}; local socks_user=${13}; local socks_pass=${14}
-    
+    local ss22_port=${15}; local ss22_pass=${16}; local ss22_cipher=${17}
     HOST_IP=$(get_public_ip)
     
-    # 1. VLESS
+    # Links
     VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_${sni}"
-    
-    # 2. SS
     SS_BASE=$(echo -n "${ss_cipher}:${ss_pass}" | base64 -w 0)
-    SS_LINK="ss://${SS_BASE}@${HOST_IP}:${ss_port}#Shoes_SS"
-    
-    # 3. SOCKS5
+    SS_LINK="ss://${SS_BASE}@${HOST_IP}:${ss_port}#Shoes_Legacy"
     SOCKS_BASE=$(echo -n "${socks_user}:${socks_pass}" | base64 -w 0)
     SOCKS_LINK="socks5://${SOCKS_BASE}@${HOST_IP}:${socks_port}#Shoes_S5"
+    SS22_BASE=$(echo -n "${ss22_cipher}:${ss22_pass}" | base64 -w 0)
+    SS22_LINK="ss://${SS22_BASE}@${HOST_IP}:${ss22_port}#Shoes_2022"
 
-    # 输出
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
-    
-    echo -e "\n--- [1] VLESS Reality (推荐/主力) ---" | tee -a "${LINK_FILE}"
+    echo -e "\n--- [1] VLESS Reality (SNI: ${sni}) ---" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${VLESS_LINK}${RESET}" | tee -a "${LINK_FILE}"
+    
+    echo -e "\n--- [2] SS-2022 (抗重放/高性能/推荐) ---" | tee -a "${LINK_FILE}"
+    echo -e "加密: ${ss22_cipher}" | tee -a "${LINK_FILE}"
+    echo -e "链接: ${GREEN}${SS22_LINK}${RESET}" | tee -a "${LINK_FILE}"
 
-    echo -e "\n--- [2] Shadowsocks (游戏/备用) ---" | tee -a "${LINK_FILE}"
+    echo -e "\n--- [3] SS-Legacy (传统/游戏) ---" | tee -a "${LINK_FILE}"
+    echo -e "加密: ${ss_cipher}" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
     
-    echo -e "\n--- [3] SOCKS5 (TG/爬虫专用) ---" | tee -a "${LINK_FILE}"
+    echo -e "\n--- [4] SOCKS5 (账号: ${socks_user}) ---" | tee -a "${LINK_FILE}"
     echo -e "地址: ${HOST_IP}:${socks_port}" | tee -a "${LINK_FILE}"
-    echo -e "用户: ${socks_user}" | tee -a "${LINK_FILE}"
-    echo -e "密码: ${socks_pass}" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SOCKS_LINK}${RESET}" | tee -a "${LINK_FILE}"
-
-    echo -e "\n--- [4] AnyTLS (HTTPS Proxy) ---" | tee -a "${LINK_FILE}"
+    
+    echo -e "\n--- [5] AnyTLS (HTTPS Proxy) ---" | tee -a "${LINK_FILE}"
     echo -e "地址: ${HOST_IP}:${any_port}" | tee -a "${LINK_FILE}"
-    echo -e "用户: ${any_user}" | tee -a "${LINK_FILE}"
-    echo -e "密码: ${any_pass}" | tee -a "${LINK_FILE}"
-    echo -e "${GRAY}(注: 这是一个 HTTPS 代理，需要信任自签名证书或在支持 insecure 的客户端使用)${RESET}" | tee -a "${LINK_FILE}"
+    echo -e "用户: ${any_user} | 密码: ${any_pass}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 辅助功能 (省略部分重复代码) ==================
+# ================== 辅助功能 (省略重复代码) ==================
 update_shoes_only() {
     echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core
     if [[ $? -eq 0 ]]; then systemctl restart shoes; echo -e "${GREEN}更新成功${RESET}"; fi
 }
+enable_bbr() {
+    if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _
+}
+view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoes -f; }
 switch_system_ipv6() {
     clear; echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
-    # ... (保持原有的 IPv6 切换逻辑不变) ...
-    # 为节省篇幅，这里调用系统 ip 命令，逻辑与 V8.0 完全一致
+    echo -e "正在扫描网卡上的公网 IPv6 地址..."
     local ip_with_prefix=(); mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
     if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}无 IPv6${RESET}"; read -p "..." _; return; fi
-    local i=1
-    for item in "${ip_with_prefix[@]}"; do echo -e " ${GREEN}[$i]${RESET} ${YELLOW}${item}${RESET}"; ((i++)); done
+    echo -e "正在测试地区与延迟..."
+    local i=1; local ping_cmd="ping -6"; command -v ping >/dev/null 2>&1 || ping_cmd="ping6"
+    for item in "${ip_with_prefix[@]}"; do
+        local addr=${item%/*}; local status_mark=""; local loc_str=""; local lat_str=""
+        if ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then status_mark="${GRAY}(备用)${RESET}"; else status_mark="${GREEN}✔${RESET}"; fi
+        local api_res=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city" 2>/dev/null)
+        if [[ -n "$api_res" ]]; then loc_str="${BLUE}[$(echo "$api_res"|jq -r '.country') $(echo "$api_res"|jq -r '.city')]${RESET}"; else loc_str="${GRAY}[未知]${RESET}"; fi
+        local lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
+        if [[ -n "$lat_val" ]]; then lat_str="${GREEN}[${lat_val}ms]${RESET}"; else lat_str="${RED}[超时]${RESET}"; fi
+        echo -e " ${GREEN}[$i]${RESET} ${YELLOW}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"; ((i++))
+    done
     echo -e " ${GREEN}[0]${RESET} 取消"; read -rp "选择: " choice
     [[ "$choice" == "0" || -z "$choice" ]] && return
     local target_item="${ip_with_prefix[$((choice-1))]}"
-    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1)
-    [[ -z "$dev_name" ]] && dev_name="eth0"
+    [[ -z "$target_item" ]] && return
+    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1); [[ -z "$dev_name" ]] && dev_name="eth0"
     for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1; done
     ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
     echo -e "${GREEN}切换成功！${RESET}"; read -rp "..." _
 }
-enable_bbr() {
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; read -p "..." _
-}
-view_realtime_log() { journalctl -u shoes -f; }
 
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V9.0) ===${RESET}"
-    echo -e "${GRAY}输入 'shoes' 再次打开 | 当前协议: VLESS+SS+SOCKS5+AnyTLS${RESET}"
-    if systemctl is-active --quiet shoes; then echo -e "状态: ${GREEN}运行中${RESET}"; else echo -e "状态: ${RED}未运行${RESET}"; fi
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V12.0 究极版) ===${RESET}"
+    echo -e "${GRAY}输入 'shoes' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
     echo "2. 停止服务"
@@ -265,15 +278,15 @@ show_menu() {
     echo "4. 查看所有链接"
     echo "5. 卸载服务"
     echo "------------------------"
-    echo "6. IPv6 出口管理"
-    echo "7. 更新内核"
-    echo "8. 开启 BBR 加速"
-    echo "9. 实时日志"
+    echo -e "${CYAN}6. 高级网络设置 (IPv6 出口管理)${RESET}"
+    echo -e "${YELLOW}7. 开启 BBR 加速 (优化网络速度)${RESET}"
+    echo -e "${BLUE}8. 更新 Shoes 内核 (保留配置文件)${RESET}"
+    echo "------------------------"
+    echo -e "${GRAY}9. 查看实时日志${RESET}"
     echo "0. 退出"
     read -p "选项: " choice
 }
 
-# ================== 入口 ==================
 if [[ ! -f /usr/bin/shoes ]]; then cp -f "$0" /usr/local/bin/shoes-menu; chmod +x /usr/local/bin/shoes-menu; ln -sf /usr/local/bin/shoes-menu /usr/bin/shoes; fi
 check_arch
 while true; do
@@ -285,8 +298,8 @@ while true; do
         4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
         5) systemctl stop shoes; systemctl disable shoes; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/bin/shoes"; systemctl daemon-reload; echo "卸载完毕";;
         6) switch_system_ipv6 ;;
-        7) update_shoes_only ;;
-        8) enable_bbr ;;
+        7) enable_bbr ;;       
+        8) update_shoes_only ;; 
         9) view_realtime_log ;;
         0) exit 0 ;;
         *) echo "无效" ;;
