@@ -26,9 +26,9 @@ TMP_DIR="/tmp/proxydl"
 # ================== 依赖检查与安装 ==================
 install_dependencies() {
     if command -v apt >/dev/null; then
-        apt update -q && apt install -y -q curl wget tar openssl jq iproute2 iptables sed
+        apt update -q && apt install -y -q curl wget tar openssl jq iproute2 iptables sed grep
     elif command -v yum >/dev/null; then
-        yum install -y -q curl wget tar openssl jq iproute iptables sed
+        yum install -y -q curl wget tar openssl jq iproute iptables sed grep
     fi
 }
 
@@ -36,7 +36,7 @@ check_and_install_deps() {
     local need_install=0
     if ! command -v jq >/dev/null; then need_install=1; fi
     if ! command -v curl >/dev/null; then need_install=1; fi
-    if ! command -v iptables >/dev/null; then need_install=1; fi
+    if ! command -v grep >/dev/null; then need_install=1; fi
     
     if [ "$need_install" -eq 1 ]; then
         echo -e "${YELLOW}>>> 检测到系统缺失必要依赖，正在自动补全...${RESET}"
@@ -228,27 +228,51 @@ generate_links_content() {
     echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 网络设置子菜单 ==================
+# ================== 网络设置子菜单 (IPv6 复刻版) ==================
 sub_switch_ipv6_exit() {
-    clear; echo -e "${CYAN}=== IPv6 出口切换 ===${RESET}"; echo -e "${GREEN}➜ ${RESET}扫描中..."
-    local ip_with_prefix=(); mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
-    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}无 IPv6${RESET}"; read -rp "..." _; return; fi
+    clear
+    echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
+    echo -e "${GREEN}➜ ${RESET}正在扫描网卡上的公网 IPv6 地址..."
+    echo -e "${GREEN}➜ ${RESET}正在进行 地区解析 与 延迟测试 (Cloudflare)..."
+    echo -e "${GRAY}(如果 IP 较多，测试可能需要几秒钟，请耐心等待)${RESET}"
+    echo ""
+    
+    local ip_with_prefix=()
+    mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
+    if [[ ${#ip_with_prefix[@]} -eq 0 ]]; then echo -e "${RED}未检测到可用的公网 IPv6 地址。${RESET}"; read -rp "按回车返回..." _; return; fi
     local current_exit_ip=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oP 'src \K\S+')
-    echo -e "${GREEN}请选择默认出口:${RESET}\n"; local i=1
+    echo -e "${GREEN}请选择要设为默认出口的 IP:${RESET}\n"
+
+    local i=1
+    local ping_cmd="ping -6"
+    if ! command -v ping >/dev/null 2>&1; then ping_cmd="ping6"; fi
+
     for item in "${ip_with_prefix[@]}"; do
-        local addr=${item%/*}; local status_mark=""
-        if [[ "$addr" == "$current_exit_ip" ]]; then status_mark="${GREEN}✔${RESET} ${YELLOW}(当前默认)${RESET}"; else status_mark="${GRAY}(可选)${RESET}"; fi
-        local loc_str=""; if command -v curl >/dev/null; then local api=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city"); if [[ -n "$api" ]]; then local c=$(echo "$api"|jq -r '.country//empty'); local t=$(echo "$api"|jq -r '.city//empty'); [[ -n "$c" ]] && loc_str="${BLUE}[${c} ${t}]${RESET}"; fi; fi
+        local addr=${item%/*}
+        local status_mark=""
+        # 100% 还原图片2的格式
+        if [[ "$addr" == "$current_exit_ip" ]]; then status_mark="${GREEN}✔${RESET} ${YELLOW}(当前活跃)${RESET}";
+        elif ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then status_mark="${GRAY}(备用)${RESET}";
+        else status_mark="${GRAY}(可选)${RESET}"; fi
+        local loc_str=""; if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then local api_res=$(curl -s --max-time 1 "http://ip-api.com/json/${addr}?lang=zh-CN&fields=country,city" 2>/dev/null); if [[ -n "$api_res" ]]; then local country=$(echo "$api_res" | jq -r '.country // empty'); local city=$(echo "$api_res" | jq -r '.city // empty'); [[ -n "$country" ]] && loc_str="${BLUE}[${country} ${city}]${RESET}" || loc_str="${GRAY}[未知]${RESET}"; else loc_str="${GRAY}[超时]${RESET}"; fi; fi
         local lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
         local lat_str=""; if [[ -n "$lat_val" ]]; then local lat_num=${lat_val%.*}; if [[ "$lat_num" -lt 100 ]]; then lat_str="${GREEN}[${lat_val}ms]${RESET}"; elif [[ "$lat_num" -lt 200 ]]; then lat_str="${YELLOW}[${lat_val}ms]${RESET}"; else lat_str="${RED}[${lat_val}ms]${RESET}"; fi; else lat_str="${RED}[超时]${RESET}"; fi
         echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"; ((i++))
     done
-    echo -e " ${GREEN}[0]${RESET} 取消返回"; read -rp "选择: " choice; [[ "$choice" == "0" || -z "$choice" ]] && return
-    local target=${ip_with_prefix[$((choice-1))]}
-    local dev=$(ip -6 route show default|awk '/dev/{print $5}'|head -n1); [[ -z "$dev" ]] && dev="eth0"
-    for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev" preferred_lft 0 >/dev/null 2>&1; done
-    ip addr change "$target" dev "$dev" preferred_lft forever >/dev/null 2>&1
-    echo -e "${GREEN}切换成功${RESET}"; read -rp "..." _
+    echo -e " ${GREEN}[0]${RESET} 取消返回"
+    echo ""
+    read -rp "请输入序号 [0-$((i-1))]: " choice
+    [[ "$choice" == "0" || -z "$choice" ]] && return
+    local target_item="${ip_with_prefix[$((choice-1))]}"
+    local target_ip="${target_item%/*}"
+    [[ -z "$target_ip" ]] && return
+    echo -e "\n正在切换出口 IP 至: $target_ip ..."
+    local gateway=$(ip -6 route show default | awk '/via/ {print $3}' | head -n1)
+    local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1); [[ -z "$dev_name" ]] && dev_name="eth0"
+    for item in "${ip_with_prefix[@]}"; do ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1; done
+    ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
+    if [[ -n "$gateway" ]]; then ip -6 route replace default via "$gateway" dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1; else ip -6 route replace default dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1; fi
+    echo -e "${GREEN}切换成功！${RESET}"; read -rp "按回车继续..." _
 }
 
 sub_set_preference() {
@@ -260,13 +284,26 @@ sub_set_preference() {
     echo -e "${GREEN}设置完成${RESET}"; read -rp "..." _
 }
 
+# ================== 端口查询 (高亮修复版) ==================
 sub_check_ports() {
     clear
     echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
     echo -e "${GRAY}重点关注 Process 为 ${GREEN}shoes-core${RESET}${GRAY} 的行，那些就是你的代理端口。${RESET}"
     echo -e "${YELLOW}Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name${RESET}"
     echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
-    ss -tulpn | grep -E "^(udp|tcp)" | sed --unbuffered "s/shoes-core/${GREEN}shoes-core${RESET}/g"
+    
+    # 使用 while read 确保整行读取，然后手动拼接颜色
+    ss -tulpn | grep -E "^(udp|tcp)" | while IFS= read -r line; do
+        # 统一紫色
+        local base_color="${PURPLE}${line}${RESET}"
+        # 替换关键词
+        if [[ "$line" == *"shoes-core"* ]]; then
+            echo -e "${PURPLE}${line//shoes-core/${GREEN}shoes-core${PURPLE}}${RESET}"
+        else
+            echo -e "${base_color}"
+        fi
+    done
+    
     echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
     echo -e "未见 ${GREEN}shoes-core${RESET} 则服务未启动"
     echo ""
@@ -282,15 +319,10 @@ menu_advanced_network() {
     done
 }
 
-# ================== 辅助功能 ==================
-update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core; if [[ $? -eq 0 ]]; then systemctl restart shoes; echo -e "${GREEN}更新成功${RESET}"; fi }
-enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
-view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoes -f; }
-
 # ================== 主菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V35.0 菜单重排版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V37.0 界面还原版) ===${RESET}"
     echo -e "${GRAY}输入 'sho' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (随机端口)"
