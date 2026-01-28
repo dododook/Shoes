@@ -19,7 +19,6 @@ TMP_DIR="/tmp/proxydl"
 
 # ================== 依赖检查 ==================
 install_dependencies() {
-    # 融合功能需要 jq 和 curl
     if command -v apt >/dev/null; then
         apt update && apt install -y curl wget tar openssl jq iproute2
     elif command -v yum >/dev/null; then
@@ -42,13 +41,12 @@ get_public_ip() {
     curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}'
 }
 
-# ================== 核心功能: IPv6 出口切换 (融合代码) ==================
+# ================== IPv6 切换功能 ==================
 switch_system_ipv6() {
     clear
     echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
     echo -e "正在扫描网卡上的公网 IPv6 地址..."
     
-    # 1. 提取所有全局 IPv6 地址 (带CIDR)
     local ip_with_prefix=()
     mapfile -t ip_with_prefix < <(ip -6 addr show scope global | grep "inet6 " | awk '{print $2}')
 
@@ -59,20 +57,14 @@ switch_system_ipv6() {
     fi
 
     echo -e "正在进行 地区解析 与 延迟测试 (Cloudflare)..."
-    echo -e "${GRAY}(如果 IP 较多，测试可能需要几秒钟，请耐心等待)${RESET}\n"
+    echo -e "${GRAY}(测试可能需要几秒钟)${RESET}\n"
     
-    # 2. 显示列表并标记当前状态
-    echo -e "请选择要设为默认出口的 IP：\n"
     local i=1
-    
-    # 检测 Ping 命令
     local ping_cmd="ping -6"
     if ! command -v ping >/dev/null 2>&1; then ping_cmd="ping6"; fi
 
     for item in "${ip_with_prefix[@]}"; do
-        local addr=${item%/*} # 提取纯 IP
-        
-        # --- 状态判断 ---
+        local addr=${item%/*}
         local status_mark=""
         if ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then
             status_mark="${GRAY}(备用)${RESET}"
@@ -80,7 +72,6 @@ switch_system_ipv6() {
             status_mark="${GREEN}✔ (当前活跃)${RESET}"
         fi
         
-        # --- A. 地区检测 (1秒超时) ---
         local loc_str=""
         if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
             local api_res
@@ -88,13 +79,12 @@ switch_system_ipv6() {
             if [[ -n "$api_res" ]]; then
                 local country=$(echo "$api_res" | jq -r '.country // empty')
                 local city=$(echo "$api_res" | jq -r '.city // empty')
-                [[ -n "$country" ]] && loc_str="${BLUE}[${country} ${city}]${RESET}" || loc_str="${GRAY}[位置未知]${RESET}"
+                [[ -n "$country" ]] && loc_str="${BLUE}[${country} ${city}]${RESET}" || loc_str="${GRAY}[未知]${RESET}"
             else
-                loc_str="${GRAY}[位置超时]${RESET}"
+                loc_str="${GRAY}[超时]${RESET}"
             fi
         fi
         
-        # --- B. 延迟检测 (1秒超时) ---
         local lat_val
         lat_val=$($ping_cmd -c 1 -w 1 -I "$addr" 2606:4700:4700::1111 2>/dev/null | grep -o 'time=[0-9.]*' | cut -d= -f2)
         local lat_str=""
@@ -111,7 +101,6 @@ switch_system_ipv6() {
             lat_str="${RED}[超时]${RESET}"
         fi
 
-        # 组合显示
         echo -e " ${GREEN}[$i]${RESET} ${YELLOW}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"
         ((i++))
     done
@@ -123,51 +112,30 @@ switch_system_ipv6() {
 
     local target_item="${ip_with_prefix[$((choice-1))]}"
     local target_ip="${target_item%/*}"
+    [[ -z "$target_ip" ]] && return
 
-    if [[ -z "$target_ip" ]]; then
-        echo -e "${RED}无效选择。${RESET}"
-        sleep 1
-        return
-    fi
-
-    # 3. 执行切换
-    echo -e "正在切换出口 IP 至: $target_ip ..."
-    
     local gateway=$(ip -6 route show default | awk '/via/ {print $3}' | head -n1)
     local dev_name=$(ip -6 route show default | awk '/dev/ {print $5}' | head -n1)
     [[ -z "$dev_name" ]] && dev_name="eth0"
 
-    # 重置所有 IPv6 寿命 (deprecate others)
     for item in "${ip_with_prefix[@]}"; do
         ip addr change "$item" dev "$dev_name" preferred_lft 0 >/dev/null 2>&1
     done
-    # 激活目标 IP (forever)
     ip addr change "$target_item" dev "$dev_name" preferred_lft forever >/dev/null 2>&1
 
-    # 强制刷新路由表 src
     if [[ -n "$gateway" ]]; then
         ip -6 route replace default via "$gateway" dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1
     else
         ip -6 route replace default dev "$dev_name" src "$target_ip" onlink >/dev/null 2>&1
     fi
 
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}切换成功！${RESET}"
-        echo -e "正在复核外网 IP..."
-        local test_res=$(curl -6 -s --max-time 3 ip.sb || echo "验证超时")
-        echo -e "当前外网 IP: ${YELLOW}${test_res}${RESET}"
-        
-        echo -e "\n${RED}注意：此修改重启后会失效。如果需要永久生效，请将 ip route 命令加入 rc.local${RESET}"
-    else
-        echo -e "${RED}切换失败，请检查权限或网络。${RESET}"
-    fi
-    
+    echo -e "${GREEN}切换成功！${RESET}"
     read -rp "按回车继续..." _
 }
 
-# ================== 安装 Shoes (集成 SS) ==================
+# ================== 安装 Shoes ==================
 install_shoes() {
-    echo -e "${GREEN}>>> 开始安装 Shoes (集成 Shadowsocks)...${RESET}"
+    echo -e "${GREEN}>>> 开始安装 Shoes (随机大厂 SNI 版)...${RESET}"
     install_dependencies
     check_arch
     
@@ -183,15 +151,29 @@ install_shoes() {
     
     tar -xzf shoes.tar.gz
     FIND_SHOES=$(find . -type f -name "shoes" | head -n 1)
-    if [[ -z "$FIND_SHOES" ]]; then
-        echo -e "${RED}解压后未找到 shoes 二进制文件${RESET}"; return;
-    fi
+    [[ -z "$FIND_SHOES" ]] && { echo -e "${RED}解压后未找到 shoes${RESET}"; return; }
+    
     cp "$FIND_SHOES" "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
 
     # 配置生成
     mkdir -p "${SHOES_CONF_DIR}"
-    SNI="www.ua.edu"
+    
+    # === 随机 SNI 逻辑 ===
+    SNI_LIST=(
+        "www.microsoft.com"
+        "itunes.apple.com"
+        "gateway.icloud.com"
+        "www.amazon.com"
+        "www.tesla.com"
+        "dl.google.com"
+        "www.yahoo.com"
+        "s.yimg.com"
+    )
+    # 随机取一个
+    SNI=${SNI_LIST[$RANDOM % ${#SNI_LIST[@]}]}
+    echo -e "${GREEN}>>> 已随机选择伪装域名: ${YELLOW}${SNI}${RESET}"
+    
     SHID=$(openssl rand -hex 8)
     VLESS_PORT=$(shuf -i 20001-30000 -n 1)
     UUID=$(cat /proc/sys/kernel/random/uuid)
@@ -201,7 +183,6 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
 
     ANYTLS_PORT=$(shuf -i 30001-40000 -n 1)
-    
     SS_PORT=$(shuf -i 40001-50000 -n 1)
     SS_CIPHER="aes-256-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
@@ -280,12 +261,13 @@ generate_links_content() {
     
     HOST_IP=$(get_public_ip)
     
-    VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_Reality"
+    # 链接中会自动带上随机到的 SNI
+    VLESS_LINK="vless://${uuid}@${HOST_IP}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_${sni}"
     SS_BASE=$(echo -n "${ss_cipher}:${ss_pass}" | base64 -w 0)
     SS_LINK="ss://${SS_BASE}@${HOST_IP}:${ss_port}#Shoes_SS"
 
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
-    echo -e "\n--- VLESS Reality ---" | tee -a "${LINK_FILE}"
+    echo -e "\n--- VLESS Reality (SNI: ${sni}) ---" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${VLESS_LINK}${RESET}" | tee -a "${LINK_FILE}"
     echo -e "\n--- Shadowsocks ---" | tee -a "${LINK_FILE}"
     echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
@@ -294,14 +276,13 @@ generate_links_content() {
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 一键管理脚本 (V5.0 融合版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 一键管理脚本 (V6.0 随机SNI版) ===${RESET}"
     
     if systemctl is-active --quiet shoes; then
         echo -e "运行状态: ${GREEN}运行中${RESET}"
     else
         echo -e "运行状态: ${RED}未运行${RESET}"
     fi
-
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes 服务"
     echo "2. 停止服务"
@@ -325,9 +306,7 @@ while true; do
         1) install_shoes ;;
         2) systemctl stop shoes; echo "已停止" ;;
         3) systemctl restart shoes; echo "已重启" ;;
-        4) 
-            if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无链接记录${RESET}"; fi 
-            ;;
+        4) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无链接记录${RESET}"; fi ;;
         5)
             systemctl stop shoes
             systemctl disable shoes
