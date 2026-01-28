@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# ================== 颜色代码 (完美复刻版) ==================
+# ================== 颜色代码 ==================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'  # 截图里的粉紫色 IP
+PURPLE='\033[0;35m' # 你的粉紫色回来啦
 CYAN='\033[0;36m'
 GRAY='\033[0;90m'
 RESET='\033[0m'
@@ -220,10 +220,9 @@ generate_links_content() {
     echo -e "用户: ${any_user} | 密码: ${any_pass}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 高级 IPv6 切换 (1:1 UI复刻版) ==================
+# ================== 高级 IPv6 切换 (1:1 视觉还原 + 智能检测) ==================
 switch_system_ipv6() {
     clear
-    # 完美复刻截图头部
     echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
     echo -e "${GREEN}➜ ${RESET}正在扫描网卡上的公网 IPv6 地址..."
     echo -e "${GREEN}➜ ${RESET}正在进行 地区解析 与 延迟测试 (Cloudflare)..."
@@ -239,6 +238,10 @@ switch_system_ipv6() {
         read -rp "按回车返回..." _
         return
     fi
+
+    # === 智能核心：获取真实的默认出口 IP ===
+    local current_exit_ip=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oP 'src \K\S+')
+    # ==================================
     
     echo -e "${GREEN}请选择要设为默认出口的 IP:${RESET}\n"
 
@@ -249,12 +252,15 @@ switch_system_ipv6() {
     for item in "${ip_with_prefix[@]}"; do
         local addr=${item%/*}
         
-        # 状态标记 (复刻截图逻辑：deprecated=备用, else=当前活跃)
+        # 状态标记逻辑 (融合了视觉与功能)
         local status_mark=""
-        if ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then
+        if [[ "$addr" == "$current_exit_ip" ]]; then
+            # 如果是默认出口，显示绿色的勾
+            status_mark="${GREEN}✔${RESET} ${YELLOW}(当前默认)${RESET}"
+        elif ip -6 addr show | grep -F "$item" | grep -q "deprecated"; then
             status_mark="${GRAY}(备用)${RESET}"
         else
-            status_mark="${GREEN}✔${RESET} ${YELLOW}(当前活跃)${RESET}"
+            status_mark="${GRAY}(可选)${RESET}"
         fi
         
         # 地区检测
@@ -288,7 +294,7 @@ switch_system_ipv6() {
             lat_str="${RED}[超时]${RESET}"
         fi
 
-        # 核心复刻：IP用紫色(PURPLE)，格式完全对其
+        # 视觉核心：IP使用紫色(PURPLE)，完美复刻你的截图
         echo -e " ${GREEN}[$i]${RESET} ${PURPLE}${addr}${RESET} ${loc_str} ${lat_str} ${status_mark}"
         ((i++))
     done
@@ -338,7 +344,7 @@ view_realtime_log() { echo -e "${CYAN}Ctrl+C 退出${RESET}"; journalctl -u shoe
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V14.0 UI复刻版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V15.0 颜值巅峰版) ===${RESET}"
     echo -e "${GRAY}输入 'shoes' 再次打开 | 状态: $(systemctl is-active --quiet shoes && echo "${GREEN}运行中" || echo "${RED}未运行")${RESET}"
     echo "------------------------"
     echo "1. 安装 / 重置 Shoes (全部重置)"
