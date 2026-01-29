@@ -13,15 +13,16 @@ RESET='\033[0m'
 # ================== 常量定义 ==================
 SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
 
-SHOES_BIN="/usr/local/bin/shoes-core"
+SHOES_REAL_BIN="/usr/local/bin/shoes-core"  # 真实二进制路径
+SHOES_WRAPPER="/usr/local/bin/shoes-run"    # 兼容启动器路径
 MENU_BIN="/usr/local/bin/sho"
 SHORTCUT_BIN="/usr/bin/sho"
 
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
 SHOES_SERVICE="/etc/systemd/system/shoes.service"
-SHOES_RC_FILE="/etc/init.d/shoes" # OpenRC 启动脚本路径
-SHOES_LOG_FILE="/var/log/shoes.log" # 统一日志文件路径
+SHOES_RC_FILE="/etc/init.d/shoes"
+SHOES_LOG_FILE="/var/log/shoes.log"
 LINK_FILE="/root/proxy_links.txt"
 TMP_DIR="/tmp/proxydl"
 
@@ -29,16 +30,15 @@ TMP_DIR="/tmp/proxydl"
 CURRENT_IPV4=""
 CURRENT_IPV6=""
 
-# ================== 依赖检查与安装 ==================
+# ================== 依赖检查 ==================
 install_dependencies() {
     if command -v apt >/dev/null; then
         apt update -q && apt install -y -q curl wget tar openssl jq iproute2 iptables sed grep
     elif command -v yum >/dev/null; then
         yum install -y -q curl wget tar openssl jq iproute iptables sed grep
     elif command -v apk >/dev/null; then
-        # Alpine 关键依赖修复
-        echo -e "${YELLOW}>>> 正在安装 Alpine 兼容依赖...${RESET}"
-        apk update && apk add --no-cache bash curl wget tar openssl jq iproute2 coreutils grep sed gcompat libc6-compat libgcc
+        echo -e "${YELLOW}>>> 正在安装 Alpine 兼容组件 (gcompat)...${RESET}"
+        apk update && apk add --no-cache bash curl wget tar openssl jq iproute2 coreutils grep sed gcompat libc6-compat
     fi
 }
 
@@ -47,7 +47,6 @@ check_and_install_deps() {
     if ! command -v jq >/dev/null; then need_install=1; fi
     if ! command -v curl >/dev/null; then need_install=1; fi
     if ! command -v grep >/dev/null; then need_install=1; fi
-    # Alpine 特有检查
     if [ -f /etc/alpine-release ] && ! command -v shuf >/dev/null; then need_install=1; fi
     
     if [ "$need_install" -eq 1 ]; then
@@ -65,24 +64,33 @@ check_arch() {
     esac
 }
 
-# ================== Alpine 兼容性手术 (Magic Fix) ==================
-fix_alpine_loader() {
-    # 仅针对 Alpine
+# ================== 核心功能：创建兼容启动器 ==================
+create_compatibility_wrapper() {
+    # 默认直接运行
+    echo '#!/bin/bash' > "$SHOES_WRAPPER"
+    echo 'exec "'"$SHOES_REAL_BIN"'" "$@"' >> "$SHOES_WRAPPER"
+    
+    # 如果是 Alpine，寻找加载器并强制加载
     if [ -f /etc/alpine-release ]; then
-        # 很多二进制文件硬编码了 /lib64/ld-linux-x86-64.so.2 这个路径
-        # Alpine 没有这个文件，所以报 "required file not found"
-        if [ ! -f /lib64/ld-linux-x86-64.so.2 ]; then
-            echo -e "${YELLOW}>>> 检测到 Alpine，正在修复动态链接库路径...${RESET}"
-            mkdir -p /lib64
-            # 尝试链接到 gcompat 的加载器 或 musl 的加载器
-            if [ -f /lib/ld-linux-x86-64.so.2 ]; then
-                ln -sf /lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
-            elif [ -f /lib/libc.musl-x86_64.so.1 ]; then
-                ln -sf /lib/libc.musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2
-            fi
-            echo -e "${GREEN}>>> 修复完成。${RESET}"
+        echo -e "${YELLOW}>>> 检测到 Alpine 系统，正在构建兼容启动器...${RESET}"
+        
+        # 寻找 musl 动态链接库
+        LOADER=$(ls /lib/ld-musl-*.so.1 2>/dev/null | head -n 1)
+        if [[ -z "$LOADER" ]]; then
+            LOADER=$(ls /lib/libc.musl-*.so.1 2>/dev/null | head -n 1)
+        fi
+        
+        if [[ -n "$LOADER" ]]; then
+            echo -e "${GREEN}>>> 找到解释器: $LOADER${RESET}"
+            # 重写启动器，使用解释器来运行二进制
+            echo '#!/bin/bash' > "$SHOES_WRAPPER"
+            echo "exec $LOADER \"$SHOES_REAL_BIN\" \"\$@\"" >> "$SHOES_WRAPPER"
+        else
+            echo -e "${RED}>>> 警告: 未找到 musl 解释器，尝试直接运行...${RESET}"
         fi
     fi
+    
+    chmod +x "$SHOES_WRAPPER"
 }
 
 # ================== 获取 IP ==================
@@ -143,11 +151,11 @@ download_shoes_core() {
     if [ -f "$SHOES_RC_FILE" ]; then rc-service shoes stop >/dev/null 2>&1; fi
     killall shoes-core >/dev/null 2>&1
     
-    cp "$FIND_SHOES" "${SHOES_BIN}"
-    chmod +x "${SHOES_BIN}"
+    cp "$FIND_SHOES" "${SHOES_REAL_BIN}"
+    chmod +x "${SHOES_REAL_BIN}"
     
-    # 执行 Alpine 修复
-    fix_alpine_loader
+    # 创建兼容层 wrapper
+    create_compatibility_wrapper
     
     return 0
 }
@@ -164,7 +172,7 @@ ask_port() {
     done
 }
 
-# ================== 服务管理 (日志修复版) ==================
+# ================== 服务管理 (指向 Wrapper) ==================
 setup_service() {
     # 1. Systemd
     if command -v systemctl >/dev/null; then
@@ -175,7 +183,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
+ExecStart=${SHOES_WRAPPER} ${SHOES_CONF_FILE}
 Restart=on-failure
 LimitNOFILE=65535
 [Install]
@@ -184,13 +192,13 @@ EOF
         systemctl daemon-reload
         systemctl enable --now shoes
         
-    # 2. OpenRC (Alpine) - 关键修复：指定日志文件
+    # 2. OpenRC (Alpine) - 指向 wrapper 并记录日志
     elif [ -f "/sbin/openrc-run" ]; then
         cat > "${SHOES_RC_FILE}" <<EOF
 #!/sbin/openrc-run
 name="shoes"
 description="Shoes Proxy Server"
-command="${SHOES_BIN}"
+command="${SHOES_WRAPPER}"
 command_args="${SHOES_CONF_FILE}"
 command_background=true
 pidfile="/run/shoes.pid"
@@ -204,7 +212,7 @@ EOF
     # 3. Fallback
     else
         killall shoes-core >/dev/null 2>&1
-        nohup ${SHOES_BIN} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 &
+        nohup ${SHOES_WRAPPER} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 &
     fi
 }
 
@@ -215,10 +223,12 @@ install_shoes() {
     download_shoes_core
     if [[ $? -ne 0 ]]; then return; fi
 
-    # 验证二进制是否可运行 (自我检查)
-    if ! ${SHOES_BIN} --help >/dev/null 2>&1; then
-        echo -e "${RED}⚠️  警告: shoes-core 似乎仍无法运行。尝试最后一次修复...${RESET}"
-        fix_alpine_loader
+    # 验证二进制是否可运行 (使用 wrapper 验证)
+    if ! ${SHOES_WRAPPER} --help >/dev/null 2>&1; then
+        echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${RESET}"
+        echo -e "${RED}严重错误: 即使使用了兼容模式，shoes-core 仍无法运行。${RESET}"
+        echo -e "${YELLOW}请尝试手动运行: /usr/local/bin/shoes-run --help${RESET}"
+        echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${RESET}"
     fi
 
     mkdir -p "${SHOES_CONF_DIR}"
@@ -243,16 +253,15 @@ install_shoes() {
     SHID=$(openssl rand -hex 8)
     UUID=$(cat /proc/sys/kernel/random/uuid)
     
+    # 使用 wrapper 生成密钥
     echo -e "${YELLOW}>>> 正在生成密钥...${RESET}"
-    KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
+    KEYPAIR=$(${SHOES_WRAPPER} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     
-    # 密钥检查
     if [[ -z "$PRIVATE_KEY" ]]; then
-        echo -e "${RED}错误：Key生成失败。使用备用 OpenSSL 模式防止空配置...${RESET}"
-        # 生成一个假的/兼容的 key 至少让程序能跑起来，方便看日志报错
-        PRIVATE_KEY="GenerateFailed_PleaseCheckLog"
+        echo -e "${RED}错误：Key生成失败。使用 OpenSSL 备用模式...${RESET}"
+        PRIVATE_KEY=$(openssl genpkey -algorithm x25519 -out /tmp/k.pem && openssl pkey -in /tmp/k.pem -text | grep "priv:" -A 3 | tail -n +2 | tr -d ' \n:' | xxd -r -p | base64)
     fi
 
     open_port "$VLESS_PORT" "tcp"; open_port "$VLESS_PORT" "udp"
@@ -389,7 +398,6 @@ update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_c
 enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
 view_realtime_log() {
     echo -e "${CYAN}Ctrl+C 退出${RESET}"
-    # 智能判断：有systemd用journalctl，没有则读文件
     if command -v journalctl >/dev/null; then
         journalctl -u shoes -f
     elif [ -f "${SHOES_LOG_FILE}" ]; then
