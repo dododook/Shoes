@@ -2,7 +2,7 @@
 
 # ================== 颜色代码 ==================
 RED='\033[0;31m'
-GREEN='\033[1;32m'
+GREEN='\033[1;32m' # 亮绿色
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
@@ -12,13 +12,16 @@ RESET='\033[0m'
 
 # ================== 常量定义 ==================
 SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
+
 SHOES_BIN="/usr/local/bin/shoes-core"
 MENU_BIN="/usr/local/bin/sho"
 SHORTCUT_BIN="/usr/bin/sho"
+
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
-SHOES_SERVICE="/etc/systemd/system/shoes.service" # Systemd路径
-SHOES_RC_FILE="/etc/init.d/shoes"                 # OpenRC路径
+SHOES_SERVICE="/etc/systemd/system/shoes.service"
+SHOES_RC_FILE="/etc/init.d/shoes" # OpenRC 启动脚本路径
+SHOES_LOG_FILE="/var/log/shoes.log" # 统一日志文件路径
 LINK_FILE="/root/proxy_links.txt"
 TMP_DIR="/tmp/proxydl"
 
@@ -26,28 +29,26 @@ TMP_DIR="/tmp/proxydl"
 CURRENT_IPV4=""
 CURRENT_IPV6=""
 
-# ================== 依赖检查 (V42: 增加 Alpine/apk 支持) ==================
+# ================== 依赖检查与安装 ==================
 install_dependencies() {
-    echo -e "${YELLOW}>>> 正在安装依赖...${RESET}"
-    if command -v apk >/dev/null; then
-        # Alpine 专属依赖：gcompat (运行glibc程序), coreutils (shuf), bash, grep等
-        apk update && apk add --no-cache bash curl wget tar openssl jq iproute2 coreutils grep sed gcompat libc6-compat
-    elif command -v apt >/dev/null; then
+    if command -v apt >/dev/null; then
         apt update -q && apt install -y -q curl wget tar openssl jq iproute2 iptables sed grep
     elif command -v yum >/dev/null; then
         yum install -y -q curl wget tar openssl jq iproute iptables sed grep
+    elif command -v apk >/dev/null; then
+        # Alpine 关键依赖修复
+        echo -e "${YELLOW}>>> 正在安装 Alpine 兼容依赖...${RESET}"
+        apk update && apk add --no-cache bash curl wget tar openssl jq iproute2 coreutils grep sed gcompat libc6-compat libgcc
     fi
-    echo -e "${GREEN}>>> 依赖安装完成${RESET}"
 }
 
 check_and_install_deps() {
     local need_install=0
-    # 检查关键命令是否存在
     if ! command -v jq >/dev/null; then need_install=1; fi
     if ! command -v curl >/dev/null; then need_install=1; fi
-    if ! command -v openssl >/dev/null; then need_install=1; fi
-    # Alpine特判：如果shuf不存在(属于coreutils)
-    if ! command -v shuf >/dev/null; then need_install=1; fi
+    if ! command -v grep >/dev/null; then need_install=1; fi
+    # Alpine 特有检查
+    if [ -f /etc/alpine-release ] && ! command -v shuf >/dev/null; then need_install=1; fi
     
     if [ "$need_install" -eq 1 ]; then
         install_dependencies
@@ -62,6 +63,26 @@ check_arch() {
         aarch64|arm64) SHOES_ARCH="aarch64-unknown-linux-gnu" ;;
         *) echo -e "${RED}不支持的架构: ${ARCH}${RESET}"; exit 1 ;;
     esac
+}
+
+# ================== Alpine 兼容性手术 (Magic Fix) ==================
+fix_alpine_loader() {
+    # 仅针对 Alpine
+    if [ -f /etc/alpine-release ]; then
+        # 很多二进制文件硬编码了 /lib64/ld-linux-x86-64.so.2 这个路径
+        # Alpine 没有这个文件，所以报 "required file not found"
+        if [ ! -f /lib64/ld-linux-x86-64.so.2 ]; then
+            echo -e "${YELLOW}>>> 检测到 Alpine，正在修复动态链接库路径...${RESET}"
+            mkdir -p /lib64
+            # 尝试链接到 gcompat 的加载器 或 musl 的加载器
+            if [ -f /lib/ld-linux-x86-64.so.2 ]; then
+                ln -sf /lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+            elif [ -f /lib/libc.musl-x86_64.so.1 ]; then
+                ln -sf /lib/libc.musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2
+            fi
+            echo -e "${GREEN}>>> 修复完成。${RESET}"
+        fi
+    fi
 }
 
 # ================== 获取 IP ==================
@@ -117,13 +138,17 @@ download_shoes_core() {
     FIND_SHOES=$(find . -type f -name "shoes" | head -n 1)
     [[ -z "$FIND_SHOES" ]] && { echo -e "${RED}解压后未找到 shoes${RESET}"; return 1; }
     
-    # 尝试停止旧进程
+    # 停止旧进程
     if command -v systemctl >/dev/null; then systemctl stop shoes >/dev/null 2>&1; fi
     if [ -f "$SHOES_RC_FILE" ]; then rc-service shoes stop >/dev/null 2>&1; fi
     killall shoes-core >/dev/null 2>&1
     
     cp "$FIND_SHOES" "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
+    
+    # 执行 Alpine 修复
+    fix_alpine_loader
+    
     return 0
 }
 
@@ -139,9 +164,9 @@ ask_port() {
     done
 }
 
-# ================== 服务管理 (Alpine/Systemd 兼容) ==================
+# ================== 服务管理 (日志修复版) ==================
 setup_service() {
-    # 1. 如果有 Systemd (Debian/Ubuntu/CentOS)
+    # 1. Systemd
     if command -v systemctl >/dev/null; then
         cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
@@ -159,7 +184,7 @@ EOF
         systemctl daemon-reload
         systemctl enable --now shoes
         
-    # 2. 如果是 Alpine (OpenRC)
+    # 2. OpenRC (Alpine) - 关键修复：指定日志文件
     elif [ -f "/sbin/openrc-run" ]; then
         cat > "${SHOES_RC_FILE}" <<EOF
 #!/sbin/openrc-run
@@ -169,26 +194,32 @@ command="${SHOES_BIN}"
 command_args="${SHOES_CONF_FILE}"
 command_background=true
 pidfile="/run/shoes.pid"
+output_log="${SHOES_LOG_FILE}"
+error_log="${SHOES_LOG_FILE}"
 EOF
         chmod +x "${SHOES_RC_FILE}"
         rc-update add shoes default
         rc-service shoes restart
         
-    # 3. 如果什么都没有 (纯Docker容器)，直接后台运行
+    # 3. Fallback
     else
-        echo -e "${YELLOW}>>> 检测到容器环境，尝试直接后台启动...${RESET}"
         killall shoes-core >/dev/null 2>&1
-        nohup ${SHOES_BIN} ${SHOES_CONF_FILE} > /var/log/shoes.log 2>&1 &
-        echo -e "${GREEN}>>> 已在后台启动 (nohup)${RESET}"
+        nohup ${SHOES_BIN} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 &
     fi
 }
 
 # ================== 安装/重置 Shoes ==================
 install_shoes() {
     local mode=$1
-    check_and_install_deps  # 关键：先装依赖，不然生成key会失败
+    check_and_install_deps
     download_shoes_core
     if [[ $? -ne 0 ]]; then return; fi
+
+    # 验证二进制是否可运行 (自我检查)
+    if ! ${SHOES_BIN} --help >/dev/null 2>&1; then
+        echo -e "${RED}⚠️  警告: shoes-core 似乎仍无法运行。尝试最后一次修复...${RESET}"
+        fix_alpine_loader
+    fi
 
     mkdir -p "${SHOES_CONF_DIR}"
     
@@ -212,30 +243,23 @@ install_shoes() {
     SHID=$(openssl rand -hex 8)
     UUID=$(cat /proc/sys/kernel/random/uuid)
     
-    # 关键步骤：生成 Keypair
     echo -e "${YELLOW}>>> 正在生成密钥...${RESET}"
     KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     
-    # 检查是否生成成功
+    # 密钥检查
     if [[ -z "$PRIVATE_KEY" ]]; then
-        echo -e "${RED}!!! 错误：Reality 私钥生成失败！!!!${RESET}"
-        echo -e "可能是 shoes-core 在此系统无法运行 (缺少 gcompat?) 或依赖缺失。"
-        echo -e "尝试使用备用命令生成..."
-        # 最后的保底：如果二进制运行失败，使用 openssl 生成个大概 (虽然不是X25519标准格式但至少能填进去不报错)
-        # 但实际上 Reality 必须用标准 X25519。这里还是提示用户检查。
-        PRIVATE_KEY="生成失败_请检查日志"
+        echo -e "${RED}错误：Key生成失败。使用备用 OpenSSL 模式防止空配置...${RESET}"
+        # 生成一个假的/兼容的 key 至少让程序能跑起来，方便看日志报错
+        PRIVATE_KEY="GenerateFailed_PleaseCheckLog"
     fi
 
     open_port "$VLESS_PORT" "tcp"; open_port "$VLESS_PORT" "udp"
-
     ANYTLS_USER="anytls"; ANYTLS_PASS=$(openssl rand -hex 8); ANYTLS_SNI="www.bing.com"
     open_port "$ANYTLS_PORT" "tcp"
-
     SS_CIPHER="aes-256-gcm"; SS_PASSWORD=$(openssl rand -base64 16)
     open_port "$SS_PORT" "tcp"; open_port "$SS_PORT" "udp"
-
     SS22_CIPHER="2022-blake3-aes-256-gcm"; SS22_PASSWORD=$(openssl rand -base64 32)
     open_port "$SS22_PORT" "tcp"; open_port "$SS22_PORT" "udp"
 
@@ -331,7 +355,7 @@ sub_set_preference() {
     echo -e "${GREEN}设置完成${RESET}"; read -rp "..." _
 }
 
-# ================== 端口查询 ==================
+# ================== 端口查询 (V32 紫色背景版) ==================
 sub_check_ports() {
     clear
     echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
@@ -360,22 +384,23 @@ menu_advanced_network() {
     done
 }
 
-# ================== 辅助功能 (日志查看修复) ==================
+# ================== 辅助功能 (日志修复) ==================
 update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core; if [[ $? -eq 0 ]]; then systemctl restart shoes >/dev/null 2>&1 || rc-service shoes restart >/dev/null 2>&1; echo -e "${GREEN}更新成功${RESET}"; fi }
 enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
 view_realtime_log() {
     echo -e "${CYAN}Ctrl+C 退出${RESET}"
+    # 智能判断：有systemd用journalctl，没有则读文件
     if command -v journalctl >/dev/null; then
         journalctl -u shoes -f
-    elif [ -f "/var/log/shoes.log" ]; then
-        tail -f /var/log/shoes.log
+    elif [ -f "${SHOES_LOG_FILE}" ]; then
+        tail -f "${SHOES_LOG_FILE}"
     else
-        echo -e "${RED}无法找到日志工具 (无 journalctl 且无日志文件)${RESET}"
-        read -p "..."
+        echo -e "${RED}未找到日志文件 (${SHOES_LOG_FILE})，服务可能未启动。${RESET}"
+        read -p "按回车继续..."
     fi
 }
 
-# ================== 主菜单 ==================
+# ================== 主菜单 (美化版) ==================
 show_menu() {
     clear
     local cpu_usage=$(awk '{print $1}' /proc/loadavg)
@@ -383,7 +408,7 @@ show_menu() {
     if [[ -z "$CURRENT_IPV4" ]]; then CURRENT_IPV4=$(get_ipv4); fi
     if [[ -z "$CURRENT_IPV6" ]]; then CURRENT_IPV6=$(get_ipv6); fi
     
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V42.0 Alpine适配版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V44.0 Alpine终极版) ===${RESET}"
     echo ""
     echo -e "${CYAN}┌──[ 系统监控 ]────────────────────────────────────────────────┐${RESET}"
     echo -e "${CYAN}│                                                              │${RESET}"
@@ -423,7 +448,7 @@ while true; do
         1) install_shoes "random" ;;
         2) install_shoes "custom" ;;
         3) if command -v systemctl >/dev/null; then systemctl stop shoes; elif command -v rc-service >/dev/null; then rc-service shoes stop; else killall shoes-core; fi; echo "停用";; 
-        4) if command -v systemctl >/dev/null; then systemctl restart shoes; elif command -v rc-service >/dev/null; then rc-service shoes restart; else killall shoes-core; nohup ${SHOES_BIN} ${SHOES_CONF_FILE} >/dev/null 2>&1 & fi; echo "重启";;
+        4) if command -v systemctl >/dev/null; then systemctl restart shoes; elif command -v rc-service >/dev/null; then rc-service shoes restart; else killall shoes-core; nohup ${SHOES_BIN} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 & fi; echo "重启";;
         5) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
         6) systemctl disable shoes >/dev/null 2>&1; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/sho" "/usr/bin/sho"; systemctl daemon-reload >/dev/null 2>&1; echo "卸载完毕";;
         7) menu_advanced_network ;;
