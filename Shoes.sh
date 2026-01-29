@@ -2,7 +2,7 @@
 
 # ================== 颜色代码 ==================
 RED='\033[0;31m'
-GREEN='\033[1;32m' # 亮绿色
+GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
@@ -13,8 +13,11 @@ RESET='\033[0m'
 # ================== 常量定义 ==================
 SCRIPT_URL="https://raw.githubusercontent.com/dododook/Shoes/refs/heads/main/Shoes.sh"
 
-SHOES_REAL_BIN="/usr/local/bin/shoes-core"  # 真实二进制路径
-SHOES_WRAPPER="/usr/local/bin/shoes-run"    # 兼容启动器路径
+# 真实二进制文件位置
+REAL_BIN="/usr/local/bin/shoes-core"
+# Alpine 专用兼容启动器位置
+ALPINE_WRAPPER="/usr/local/bin/shoes-run"
+
 MENU_BIN="/usr/local/bin/sho"
 SHORTCUT_BIN="/usr/bin/sho"
 
@@ -26,155 +29,112 @@ SHOES_LOG_FILE="/var/log/shoes.log"
 LINK_FILE="/root/proxy_links.txt"
 TMP_DIR="/tmp/proxydl"
 
+# 动态决定最终调用的命令（初始化为空）
+SHOES_CMD=""
+
 # 缓存 IP
 CURRENT_IPV4=""
 CURRENT_IPV6=""
 
-# ================== 依赖检查 ==================
+# ================== 1. 智能环境检测与依赖 ==================
 install_dependencies() {
     if command -v apt >/dev/null; then
+        # Debian/Ubuntu
         apt update -q && apt install -y -q curl wget tar openssl jq iproute2 iptables sed grep
     elif command -v yum >/dev/null; then
+        # CentOS/RHEL
         yum install -y -q curl wget tar openssl jq iproute iptables sed grep
     elif command -v apk >/dev/null; then
-        echo -e "${YELLOW}>>> 正在安装 Alpine 兼容组件 (gcompat)...${RESET}"
+        # Alpine (特殊照顾)
+        echo -e "${YELLOW}>>> 检测到 Alpine 系统，正在安装兼容层...${RESET}"
         apk update && apk add --no-cache bash curl wget tar openssl jq iproute2 coreutils grep sed gcompat libc6-compat
     fi
 }
 
-check_and_install_deps() {
+check_env_and_set_cmd() {
+    # 检查依赖
     local need_install=0
     if ! command -v jq >/dev/null; then need_install=1; fi
     if ! command -v curl >/dev/null; then need_install=1; fi
-    if ! command -v grep >/dev/null; then need_install=1; fi
-    if [ -f /etc/alpine-release ] && ! command -v shuf >/dev/null; then need_install=1; fi
+    if [ -f /etc/alpine-release ] && ! command -v shuf >/dev/null; then need_install=1; fi # Alpine缺shuf
     
     if [ "$need_install" -eq 1 ]; then
+        echo -e "${YELLOW}>>> 系统环境初始化...${RESET}"
         install_dependencies
+    fi
+
+    # === 核心逻辑：决定使用哪个命令 ===
+    if [ -f /etc/alpine-release ]; then
+        # Alpine 模式：使用兼容启动器
+        SHOES_CMD="$ALPINE_WRAPPER"
+    else
+        # 普通模式：直接使用二进制
+        SHOES_CMD="$REAL_BIN"
     fi
 }
 
-# ================== 架构检测 ==================
-check_arch() {
+# ================== 2. 核心下载与 Alpine 适配 ==================
+download_shoes_core() {
+    echo -e "${GREEN}>>> 正在获取最新 Shoes 版本信息...${RESET}"
+    # 架构检测
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64) SHOES_ARCH="x86_64-unknown-linux-gnu" ;;
         aarch64|arm64) SHOES_ARCH="aarch64-unknown-linux-gnu" ;;
         *) echo -e "${RED}不支持的架构: ${ARCH}${RESET}"; exit 1 ;;
     esac
-}
 
-# ================== 核心功能：创建兼容启动器 ==================
-create_compatibility_wrapper() {
-    # 默认直接运行
-    echo '#!/bin/bash' > "$SHOES_WRAPPER"
-    echo 'exec "'"$SHOES_REAL_BIN"'" "$@"' >> "$SHOES_WRAPPER"
-    
-    # 如果是 Alpine，寻找加载器并强制加载
-    if [ -f /etc/alpine-release ]; then
-        echo -e "${YELLOW}>>> 检测到 Alpine 系统，正在构建兼容启动器...${RESET}"
-        
-        # 寻找 musl 动态链接库
-        LOADER=$(ls /lib/ld-musl-*.so.1 2>/dev/null | head -n 1)
-        if [[ -z "$LOADER" ]]; then
-            LOADER=$(ls /lib/libc.musl-*.so.1 2>/dev/null | head -n 1)
-        fi
-        
-        if [[ -n "$LOADER" ]]; then
-            echo -e "${GREEN}>>> 找到解释器: $LOADER${RESET}"
-            # 重写启动器，使用解释器来运行二进制
-            echo '#!/bin/bash' > "$SHOES_WRAPPER"
-            echo "exec $LOADER \"$SHOES_REAL_BIN\" \"\$@\"" >> "$SHOES_WRAPPER"
-        else
-            echo -e "${RED}>>> 警告: 未找到 musl 解释器，尝试直接运行...${RESET}"
-        fi
-    fi
-    
-    chmod +x "$SHOES_WRAPPER"
-}
-
-# ================== 获取 IP ==================
-get_ipv4() {
-    local ip=$(curl -s -4 --max-time 1 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-    if [[ -z "$ip" ]]; then echo "检测中..."; else echo "$ip"; fi
-}
-get_ipv6() {
-    local ip=$(curl -s -6 --max-time 1 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-    if [[ -z "$ip" ]]; then echo "${GRAY}未检测到 IPv6${RESET}"; else echo "$ip"; fi
-}
-
-# ================== 快捷指令 ==================
-create_shortcut() {
-    local current_file=$(readlink -f "$0")
-    if [[ -f "$current_file" && ! -L "$current_file" && "$0" != "-bash" ]]; then
-        cp -f "$current_file" "$MENU_BIN"
-        chmod +x "$MENU_BIN"
-    else
-        if curl -s --head --request GET "$SCRIPT_URL" | grep "200 OK" > /dev/null; then
-            curl -sL "$SCRIPT_URL" -o "$MENU_BIN"
-            chmod +x "$MENU_BIN"
-        fi
-    fi
-    if [[ -f "/usr/bin/shoes" ]]; then rm -f "/usr/bin/shoes"; fi
-    hash -r 2>/dev/null
-    ln -sf "$MENU_BIN" "$SHORTCUT_BIN"
-}
-
-# ================== 端口放行 ==================
-open_port() {
-    local port=$1
-    local protocol=$2
-    if command -v iptables >/dev/null; then iptables -I INPUT -p $protocol --dport $port -j ACCEPT 2>/dev/null; fi
-    if command -v ufw >/dev/null; then if ufw status | grep -q "Status: active"; then ufw allow $port/$protocol >/dev/null; fi; fi
-    if command -v firewall-cmd >/dev/null; then if firewall-cmd --state 2>/dev/null | grep -q "running"; then firewall-cmd --zone=public --add-port=$port/$protocol --permanent >/dev/null; firewall-cmd --reload >/dev/null; fi; fi
-}
-
-# ================== 核心下载 ==================
-download_shoes_core() {
-    echo -e "${GREEN}>>> 正在获取最新 Shoes 版本信息...${RESET}"
-    check_arch
     SHOES_VER=$(curl -s https://api.github.com/repos/cfal/shoes/releases/latest | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    [[ -z "$SHOES_VER" ]] && { echo -e "${RED}获取 Shoes 版本失败${RESET}"; return 1; }
+    [[ -z "$SHOES_VER" ]] && { echo -e "${RED}获取版本失败${RESET}"; return 1; }
     
     mkdir -p "${TMP_DIR}"
     cd "${TMP_DIR}" || exit 1
-    SHOES_URL="https://github.com/cfal/shoes/releases/download/v${SHOES_VER}/shoes-${SHOES_ARCH}.tar.gz"
-    echo -e "下载: $SHOES_URL"
-    wget -O shoes.tar.gz "$SHOES_URL" || { echo -e "${RED}下载失败${RESET}"; return 1; }
+    
+    # 下载
+    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${SHOES_VER}/shoes-${SHOES_ARCH}.tar.gz" || { echo -e "${RED}下载失败${RESET}"; return 1; }
     
     tar -xzf shoes.tar.gz
     FIND_SHOES=$(find . -type f -name "shoes" | head -n 1)
-    [[ -z "$FIND_SHOES" ]] && { echo -e "${RED}解压后未找到 shoes${RESET}"; return 1; }
+    [[ -z "$FIND_SHOES" ]] && { echo -e "${RED}解压失败${RESET}"; return 1; }
     
     # 停止旧进程
-    if command -v systemctl >/dev/null; then systemctl stop shoes >/dev/null 2>&1; fi
-    if [ -f "$SHOES_RC_FILE" ]; then rc-service shoes stop >/dev/null 2>&1; fi
     killall shoes-core >/dev/null 2>&1
     
-    cp "$FIND_SHOES" "${SHOES_REAL_BIN}"
-    chmod +x "${SHOES_REAL_BIN}"
+    # 移动真实二进制
+    cp "$FIND_SHOES" "${REAL_BIN}"
+    chmod +x "${REAL_BIN}"
     
-    # 创建兼容层 wrapper
-    create_compatibility_wrapper
+    # === Alpine 专属逻辑 ===
+    if [ -f /etc/alpine-release ]; then
+        echo -e "${YELLOW}>>> 正在构建 Alpine 兼容启动器...${RESET}"
+        # 寻找 musl 解释器
+        LOADER=$(ls /lib/ld-musl-*.so.1 2>/dev/null | head -n 1)
+        if [[ -z "$LOADER" ]]; then LOADER=$(ls /lib/libc.musl-*.so.1 2>/dev/null | head -n 1); fi
+        
+        if [[ -n "$LOADER" ]]; then
+            # 创建包装器：强行指定解释器运行
+            echo '#!/bin/bash' > "$ALPINE_WRAPPER"
+            echo "exec $LOADER \"$REAL_BIN\" \"\$@\"" >> "$ALPINE_WRAPPER"
+            chmod +x "$ALPINE_WRAPPER"
+            echo -e "${GREEN}>>> 兼容启动器已建立: $ALPINE_WRAPPER${RESET}"
+        else
+            echo -e "${RED}>>> 严重警告: 未找到 musl 解释器，Alpine 可能无法运行！${RESET}"
+            # 这种情况下只能死马当活马医，直接复制
+            cp "${REAL_BIN}" "$ALPINE_WRAPPER"
+        fi
+        SHOES_CMD="$ALPINE_WRAPPER"
+    else
+        # 非 Alpine，清理可能残留的 wrapper，确保纯净
+        rm -f "$ALPINE_WRAPPER"
+        SHOES_CMD="$REAL_BIN"
+    fi
     
     return 0
 }
 
-# ================== 端口询问 ==================
-ask_port() {
-    local prompt=$1
-    local default_port=$2
-    local port_var=""
-    while true; do
-        read -rp "$prompt [默认随机: $default_port]: " port_var
-        if [[ -z "$port_var" ]]; then echo "$default_port"; return; fi
-        if [[ "$port_var" =~ ^[0-9]+$ ]] && [ "$port_var" -ge 1 ] && [ "$port_var" -le 65535 ]; then echo "$port_var"; return; else echo -e "${RED}无效端口${RESET}" >&2; fi
-    done
-}
-
-# ================== 服务管理 (指向 Wrapper) ==================
+# ================== 3. 服务配置 (自动适配) ==================
 setup_service() {
-    # 1. Systemd
+    # 场景 A: Systemd (Ubuntu/Debian/CentOS) - 使用纯净模式
     if command -v systemctl >/dev/null; then
         cat > "${SHOES_SERVICE}" <<EOF
 [Unit]
@@ -183,7 +143,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=${SHOES_WRAPPER} ${SHOES_CONF_FILE}
+ExecStart=${SHOES_CMD} ${SHOES_CONF_FILE}
 Restart=on-failure
 LimitNOFILE=65535
 [Install]
@@ -192,13 +152,13 @@ EOF
         systemctl daemon-reload
         systemctl enable --now shoes
         
-    # 2. OpenRC (Alpine) - 指向 wrapper 并记录日志
+    # 场景 B: OpenRC (Alpine) - 使用兼容模式+日志修正
     elif [ -f "/sbin/openrc-run" ]; then
         cat > "${SHOES_RC_FILE}" <<EOF
 #!/sbin/openrc-run
 name="shoes"
 description="Shoes Proxy Server"
-command="${SHOES_WRAPPER}"
+command="${SHOES_CMD}"
 command_args="${SHOES_CONF_FILE}"
 command_background=true
 pidfile="/run/shoes.pid"
@@ -208,36 +168,64 @@ EOF
         chmod +x "${SHOES_RC_FILE}"
         rc-update add shoes default
         rc-service shoes restart
-        
-    # 3. Fallback
+    
+    # 场景 C: 容器/其他
     else
-        killall shoes-core >/dev/null 2>&1
-        nohup ${SHOES_WRAPPER} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 &
+        nohup ${SHOES_CMD} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 &
     fi
 }
 
-# ================== 安装/重置 Shoes ==================
+# ================== 4. 辅助功能 ==================
+get_ipv4() {
+    local ip=$(curl -s -4 --max-time 1 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
+    if [[ -z "$ip" ]]; then echo "检测中..."; else echo "$ip"; fi
+}
+get_ipv6() {
+    local ip=$(curl -s -6 --max-time 1 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
+    if [[ -z "$ip" ]]; then echo "${GRAY}未检测到 IPv6${RESET}"; else echo "$ip"; fi
+}
+
+open_port() {
+    local port=$1
+    local protocol=$2
+    if command -v iptables >/dev/null; then iptables -I INPUT -p $protocol --dport $port -j ACCEPT 2>/dev/null; fi
+    if command -v ufw >/dev/null; then if ufw status | grep -q "Status: active"; then ufw allow $port/$protocol >/dev/null; fi; fi
+    if command -v firewall-cmd >/dev/null; then if firewall-cmd --state 2>/dev/null | grep -q "running"; then firewall-cmd --zone=public --add-port=$port/$protocol --permanent >/dev/null; firewall-cmd --reload >/dev/null; fi; fi
+}
+
+create_shortcut() {
+    local current_file=$(readlink -f "$0")
+    if [[ -f "$current_file" && ! -L "$current_file" && "$0" != "-bash" ]]; then cp -f "$current_file" "$MENU_BIN"; chmod +x "$MENU_BIN"; 
+    else if curl -s --head --request GET "$SCRIPT_URL" | grep "200 OK" > /dev/null; then curl -sL "$SCRIPT_URL" -o "$MENU_BIN"; chmod +x "$MENU_BIN"; fi; fi
+    ln -sf "$MENU_BIN" "$SHORTCUT_BIN"
+}
+
+ask_port() {
+    local prompt=$1; local default_port=$2; local port_var=""
+    while true; do
+        read -rp "$prompt [默认随机: $default_port]: " port_var
+        if [[ -z "$port_var" ]]; then echo "$default_port"; return; fi
+        if [[ "$port_var" =~ ^[0-9]+$ ]] && [ "$port_var" -ge 1 ] && [ "$port_var" -le 65535 ]; then echo "$port_var"; return; else echo -e "${RED}无效端口${RESET}" >&2; fi
+    done
+}
+
+# ================== 5. 安装流程 ==================
 install_shoes() {
     local mode=$1
-    check_and_install_deps
+    check_env_and_set_cmd # 初始化环境和 CMD 变量
     download_shoes_core
     if [[ $? -ne 0 ]]; then return; fi
 
-    # 验证二进制是否可运行 (使用 wrapper 验证)
-    if ! ${SHOES_WRAPPER} --help >/dev/null 2>&1; then
-        echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${RESET}"
-        echo -e "${RED}严重错误: 即使使用了兼容模式，shoes-core 仍无法运行。${RESET}"
-        echo -e "${YELLOW}请尝试手动运行: /usr/local/bin/shoes-run --help${RESET}"
-        echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${RESET}"
+    # 验证运行能力
+    if ! ${SHOES_CMD} --help >/dev/null 2>&1; then
+        echo -e "${RED}错误: shoes-core 无法运行。${RESET}"
+        if [ -f /etc/alpine-release ]; then echo -e "Alpine用户请尝试手动运行: apk add gcompat libc6-compat"; fi
     fi
 
     mkdir -p "${SHOES_CONF_DIR}"
     
-    local rnd_vless=$(shuf -i 20001-30000 -n 1)
-    local rnd_any=$(shuf -i 30001-35000 -n 1)
-    local rnd_ss=$(shuf -i 35001-40000 -n 1)
-    local rnd_ss22=$(shuf -i 40001-50000 -n 1)
-
+    local rnd_vless=$(shuf -i 20001-30000 -n 1); local rnd_any=$(shuf -i 30001-35000 -n 1)
+    local rnd_ss=$(shuf -i 35001-40000 -n 1); local rnd_ss22=$(shuf -i 40001-50000 -n 1)
     VLESS_PORT=$rnd_vless; ANYTLS_PORT=$rnd_any; SS_PORT=$rnd_ss; SS22_PORT=$rnd_ss22
 
     if [[ "$mode" == "custom" ]]; then
@@ -253,24 +241,21 @@ install_shoes() {
     SHID=$(openssl rand -hex 8)
     UUID=$(cat /proc/sys/kernel/random/uuid)
     
-    # 使用 wrapper 生成密钥
     echo -e "${YELLOW}>>> 正在生成密钥...${RESET}"
-    KEYPAIR=$(${SHOES_WRAPPER} generate-reality-keypair)
+    # 使用正确的 CMD 生成密钥
+    KEYPAIR=$(${SHOES_CMD} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     
     if [[ -z "$PRIVATE_KEY" ]]; then
-        echo -e "${RED}错误：Key生成失败。使用 OpenSSL 备用模式...${RESET}"
+        echo -e "${RED}密钥生成失败，使用 OpenSSL 备用生成...${RESET}"
         PRIVATE_KEY=$(openssl genpkey -algorithm x25519 -out /tmp/k.pem && openssl pkey -in /tmp/k.pem -text | grep "priv:" -A 3 | tail -n +2 | tr -d ' \n:' | xxd -r -p | base64)
     fi
 
     open_port "$VLESS_PORT" "tcp"; open_port "$VLESS_PORT" "udp"
-    ANYTLS_USER="anytls"; ANYTLS_PASS=$(openssl rand -hex 8); ANYTLS_SNI="www.bing.com"
-    open_port "$ANYTLS_PORT" "tcp"
-    SS_CIPHER="aes-256-gcm"; SS_PASSWORD=$(openssl rand -base64 16)
-    open_port "$SS_PORT" "tcp"; open_port "$SS_PORT" "udp"
-    SS22_CIPHER="2022-blake3-aes-256-gcm"; SS22_PASSWORD=$(openssl rand -base64 32)
-    open_port "$SS22_PORT" "tcp"; open_port "$SS22_PORT" "udp"
+    ANYTLS_USER="anytls"; ANYTLS_PASS=$(openssl rand -hex 8); ANYTLS_SNI="www.bing.com"; open_port "$ANYTLS_PORT" "tcp"
+    SS_CIPHER="aes-256-gcm"; SS_PASSWORD=$(openssl rand -base64 16); open_port "$SS_PORT" "tcp"; open_port "$SS_PORT" "udp"
+    SS22_CIPHER="2022-blake3-aes-256-gcm"; SS22_PASSWORD=$(openssl rand -base64 32); open_port "$SS22_PORT" "tcp"; open_port "$SS22_PORT" "udp"
 
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}"
@@ -289,37 +274,27 @@ EOF
     setup_service
     create_shortcut
     echo -e "${GREEN}Shoes 安装完成！${RESET}"
-    generate_links_content "$UUID" "$VLESS_PORT" "$SNI" "$PUBLIC_KEY" "$SHID" "$SS_PORT" "$SS_PASSWORD" "$SS_CIPHER" "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PASS" "$ANYTLS_SNI" "$SS22_PORT" "$SS22_PASSWORD" "$SS22_CIPHER"
-}
-
-# ================== 生成链接 ==================
-generate_links_content() {
-    local uuid=$1; local vless_port=$2; local sni=$3; local pbk=$4; local sid=$5
-    local ss_port=$6; local ss_pass=$7; local ss_cipher=$8
-    local any_port=$9; local any_user=${10}; local any_pass=${11}; local any_sni=${12}
-    local ss22_port=${13}; local ss22_pass=${14}; local ss22_cipher=${15}
-    local ip=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
     
-    VLESS_LINK="vless://${uuid}@${ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=random&pbk=${pbk}&sid=${sid}&type=tcp#Shoes_${sni}"
-    SS_BASE=$(echo -n "${ss_cipher}:${ss_pass}" | base64 -w 0)
-    SS_LINK="ss://${SS_BASE}@${ip}:${ss_port}#Shoes_Legacy"
-    SS22_BASE=$(echo -n "${ss22_cipher}:${ss22_pass}" | base64 -w 0)
-    SS22_LINK="ss://${SS22_BASE}@${ip}:${ss22_port}#Shoes_2022"
-    ANYTLS_LINK="anytls://${any_pass}@${ip}:${any_port}?security=tls&insecure=1&type=tcp&sni=${any_sni}#Shoes_AnyTLS"
-
+    # 生成链接部分
+    local ip=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
     echo -e "\n${YELLOW}====== 配置信息汇总 ======${RESET}" > "${LINK_FILE}"
-    echo -e "\n--- [1] VLESS Reality (SNI: ${sni}) ---" | tee -a "${LINK_FILE}"
-    echo -e "链接: ${GREEN}${VLESS_LINK}${RESET}" | tee -a "${LINK_FILE}"
+    echo -e "\n--- [1] VLESS Reality (SNI: ${SNI}) ---" | tee -a "${LINK_FILE}"
+    echo -e "链接: ${GREEN}vless://${UUID}@${ip}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#Shoes_${SNI}${RESET}" | tee -a "${LINK_FILE}"
+    
+    local ss_base=$(echo -n "${SS_CIPHER}:${SS_PASSWORD}" | base64 -w 0)
     echo -e "\n--- [2] SS-2022 (抗重放/推荐) ---" | tee -a "${LINK_FILE}"
-    echo -e "链接: ${GREEN}${SS22_LINK}${RESET}" | tee -a "${LINK_FILE}"
+    local ss22_base=$(echo -n "${SS22_CIPHER}:${SS22_PASSWORD}" | base64 -w 0)
+    echo -e "链接: ${GREEN}ss://${ss22_base}@${ip}:${SS22_PORT}#Shoes_2022${RESET}" | tee -a "${LINK_FILE}"
+    
     echo -e "\n--- [3] SS-Legacy (传统/游戏) ---" | tee -a "${LINK_FILE}"
-    echo -e "链接: ${GREEN}${SS_LINK}${RESET}" | tee -a "${LINK_FILE}"
+    echo -e "链接: ${GREEN}ss://${ss_base}@${ip}:${SS_PORT}#Shoes_Legacy${RESET}" | tee -a "${LINK_FILE}"
+    
     echo -e "\n--- [4] AnyTLS (HTTPS Proxy) ---" | tee -a "${LINK_FILE}"
-    echo -e "端口: ${RED}${any_port}${RESET}" | tee -a "${LINK_FILE}"
-    echo -e "链接: ${GREEN}${ANYTLS_LINK}${RESET}" | tee -a "${LINK_FILE}"
+    echo -e "端口: ${RED}${ANYTLS_PORT}${RESET}" | tee -a "${LINK_FILE}"
+    echo -e "链接: ${GREEN}anytls://${ANYTLS_PASS}@${ip}:${ANYTLS_PORT}?security=tls&insecure=1&type=tcp&sni=${ANYTLS_SNI}#Shoes_AnyTLS${RESET}" | tee -a "${LINK_FILE}"
 }
 
-# ================== 网络设置 (IPv6 经典版) ==================
+# ================== Menu 6 功能函数 ==================
 sub_switch_ipv6_exit() {
     clear
     echo -e "${CYAN}=== 系统级 IPv6 出口 IP 切换 ===${RESET}"
@@ -359,56 +334,37 @@ sub_set_preference() {
     clear; echo -e "${CYAN}=== IPv4/v6 优先级 ===${RESET}"
     grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null && echo -e "当前: ${GREEN}IPv4 优先${RESET}" || echo -e "当前: ${BLUE}IPv6 优先${RESET}"
     echo -e "\n${GREEN}[1]${RESET} 设为 IPv4 优先\n${GREEN}[2]${RESET} 设为 IPv6 优先\n${GREEN}[0]${RESET} 返回\n"
-    read -rp "选择: " c
-    case "$c" in 1) echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf ;; 2) sed -i '/^precedence ::ffff:0:0\/96 100/d' /etc/gai.conf ;; esac
+    read -rp "选择: " c; case "$c" in 1) echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf ;; 2) sed -i '/^precedence ::ffff:0:0\/96 100/d' /etc/gai.conf ;; esac
     echo -e "${GREEN}设置完成${RESET}"; read -rp "..." _
 }
 
-# ================== 端口查询 (V32 紫色背景版) ==================
 sub_check_ports() {
-    clear
-    echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
+    clear; echo -e "${CYAN}=== 端口监听状态 (ss -tulpn) ===${RESET}"
     echo -e "${GRAY}重点关注 Process 为 ${GREEN}shoes-core${RESET}${GRAY} 的行，那些就是你的代理端口。${RESET}"
     echo -e "${YELLOW}Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name${RESET}"
     echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
     ss -tulpn | grep -E "^(udp|tcp)" | while read -r line; do
-        if [[ "$line" == *"shoes-core"* ]]; then
-            echo -e "${PURPLE}${line//shoes-core/${GREEN}shoes-core${PURPLE}}${RESET}"
-        else
-            echo -e "${PURPLE}${line}${RESET}"
-        fi
+        if [[ "$line" == *"shoes-core"* ]]; then echo -e "${PURPLE}${line//shoes-core/${GREEN}shoes-core${PURPLE}}${RESET}"; else echo -e "${PURPLE}${line}${RESET}"; fi
     done
     echo -e "${GRAY}-----------------------------------------------------------------------------------------${RESET}"
-    echo -e "未见 ${GREEN}shoes-core${RESET} 则服务未启动"
-    echo ""
-    read -rp "按回车返回..." _
+    echo -e "未见 ${GREEN}shoes-core${RESET} 则服务未启动"; echo ""; read -rp "按回车返回..." _
 }
 
 menu_advanced_network() {
     while true; do
         clear; echo -e "${CYAN}=== 高级网络设置 ===${RESET}"
         echo -e "${GREEN}[1]${RESET} 切换 IPv6 出口 IP\n${GREEN}[2]${RESET} 设置 IPv4/IPv6 优先级\n${GREEN}[3]${RESET} 查询端口监听 (美化版)\n${GREEN}[0]${RESET} 返回"
-        read -rp "选择: " c
-        case "$c" in 1) sub_switch_ipv6_exit;; 2) sub_set_preference;; 3) sub_check_ports;; 0) return;; esac
+        read -rp "选择: " c; case "$c" in 1) sub_switch_ipv6_exit;; 2) sub_set_preference;; 3) sub_check_ports;; 0) return;; esac
     done
 }
 
-# ================== 辅助功能 (日志修复) ==================
-update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; download_shoes_core; if [[ $? -eq 0 ]]; then systemctl restart shoes >/dev/null 2>&1 || rc-service shoes restart >/dev/null 2>&1; echo -e "${GREEN}更新成功${RESET}"; fi }
+update_shoes_only() { echo -e "${CYAN}更新内核...${RESET}"; check_env_and_set_cmd; download_shoes_core; if [[ $? -eq 0 ]]; then if command -v systemctl >/dev/null; then systemctl restart shoes; else rc-service shoes restart; fi; echo -e "${GREEN}更新成功${RESET}"; fi }
 enable_bbr() { if grep -q "bbr" /etc/sysctl.conf; then echo -e "${GREEN}BBR 已开启${RESET}"; else echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; echo -e "${GREEN}BBR 已开启${RESET}"; fi; read -p "..." _; }
 view_realtime_log() {
     echo -e "${CYAN}Ctrl+C 退出${RESET}"
-    if command -v journalctl >/dev/null; then
-        journalctl -u shoes -f
-    elif [ -f "${SHOES_LOG_FILE}" ]; then
-        tail -f "${SHOES_LOG_FILE}"
-    else
-        echo -e "${RED}未找到日志文件 (${SHOES_LOG_FILE})，服务可能未启动。${RESET}"
-        read -p "按回车继续..."
-    fi
+    if command -v journalctl >/dev/null; then journalctl -u shoes -f; elif [ -f "${SHOES_LOG_FILE}" ]; then tail -f "${SHOES_LOG_FILE}"; else echo -e "${RED}无日志文件${RESET}"; read -p "..."; fi
 }
 
-# ================== 主菜单 (美化版) ==================
 show_menu() {
     clear
     local cpu_usage=$(awk '{print $1}' /proc/loadavg)
@@ -416,7 +372,7 @@ show_menu() {
     if [[ -z "$CURRENT_IPV4" ]]; then CURRENT_IPV4=$(get_ipv4); fi
     if [[ -z "$CURRENT_IPV6" ]]; then CURRENT_IPV6=$(get_ipv6); fi
     
-    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V44.0 Alpine终极版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 全协议管理脚本 (V46.0 智能双核版) ===${RESET}"
     echo ""
     echo -e "${CYAN}┌──[ 系统监控 ]────────────────────────────────────────────────┐${RESET}"
     echo -e "${CYAN}│                                                              │${RESET}"
@@ -445,6 +401,7 @@ show_menu() {
 }
 
 check_and_install_deps
+check_env_and_set_cmd # 启动时判断模式
 create_shortcut
 check_arch
 CURRENT_IPV4=$(get_ipv4)
@@ -456,9 +413,9 @@ while true; do
         1) install_shoes "random" ;;
         2) install_shoes "custom" ;;
         3) if command -v systemctl >/dev/null; then systemctl stop shoes; elif command -v rc-service >/dev/null; then rc-service shoes stop; else killall shoes-core; fi; echo "停用";; 
-        4) if command -v systemctl >/dev/null; then systemctl restart shoes; elif command -v rc-service >/dev/null; then rc-service shoes restart; else killall shoes-core; nohup ${SHOES_BIN} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 & fi; echo "重启";;
+        4) if command -v systemctl >/dev/null; then systemctl restart shoes; elif command -v rc-service >/dev/null; then rc-service shoes restart; else killall shoes-core; nohup ${SHOES_CMD} ${SHOES_CONF_FILE} > "${SHOES_LOG_FILE}" 2>&1 & fi; echo "重启";;
         5) if [[ -f "${LINK_FILE}" ]]; then cat "${LINK_FILE}"; else echo -e "${RED}无配置${RESET}"; fi ;;
-        6) systemctl disable shoes >/dev/null 2>&1; rm -f "${SHOES_SERVICE}" "${SHOES_CONF_DIR}" "${SHOES_BIN}" "/usr/local/bin/sho" "/usr/bin/sho"; systemctl daemon-reload >/dev/null 2>&1; echo "卸载完毕";;
+        6) if command -v systemctl >/dev/null; then systemctl disable shoes >/dev/null 2>&1; else rc-update del shoes default >/dev/null 2>&1; fi; rm -f "${SHOES_SERVICE}" "${SHOES_RC_FILE}" "${SHOES_CONF_DIR}" "${REAL_BIN}" "${ALPINE_WRAPPER}" "/usr/local/bin/sho" "/usr/bin/sho"; echo "卸载完毕";;
         7) menu_advanced_network ;;
         8) enable_bbr ;;       
         9) update_shoes_only ;; 
